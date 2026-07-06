@@ -231,7 +231,7 @@ fn dispatch_once(
   connection: pog.Connection,
   stream_name: String,
 ) -> Result(factos_pog.Dispatch(Event), factos_pog.Error(Nil)) {
-  factos_pog.new_dispatch_builder(
+  factos_pog.new_dispatch(
     connection: connection,
     stream: stream_name,
     decider: decider(),

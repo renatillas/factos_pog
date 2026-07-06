@@ -138,7 +138,7 @@ type DispatchEffects(event, effect) {
 ///
 /// By default the builder uses one-stream consistency, no reactor effects, and
 /// 100 attempts for retryable serializable transaction conflicts.
-pub fn new_dispatch_builder(
+pub fn new_dispatch(
   connection connection: pog.Connection,
   stream stream_name: String,
   decider decider: factos.Decider(command, state, event, domain_error),

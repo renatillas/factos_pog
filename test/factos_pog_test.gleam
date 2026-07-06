@@ -66,7 +66,7 @@ pub fn dispatch_builder_with_one_retry_attempt_persists_events_test_() -> Timeou
       reset_schema(connection)
 
       let assert Ok(dispatch) =
-        factos_pog.new_dispatch_builder(
+        factos_pog.new_dispatch(
           connection: connection,
           stream: "user-renata",
           decider: decider(),
@@ -223,7 +223,7 @@ pub fn dispatch_builder_with_query_filters_before_decoding_unknown_events_test_(
       let query = username_query("renata")
 
       let assert Ok(dispatch) =
-        factos_pog.new_dispatch_builder(
+        factos_pog.new_dispatch(
           connection: connection,
           stream: "user-renata",
           decider: decider(),
@@ -329,7 +329,7 @@ pub fn read_events_after_returns_global_position_slice_test_() -> Timeout(Nil) {
           ]),
         ])
       let assert Ok(first_dispatch) =
-        factos_pog.new_dispatch_builder(
+        factos_pog.new_dispatch(
           connection: connection,
           stream: "user-renata",
           decider: decider(),
@@ -339,7 +339,7 @@ pub fn read_events_after_returns_global_position_slice_test_() -> Timeout(Nil) {
         |> factos_pog.dispatch(RegisterUser("renata"))
 
       let assert Ok(second_dispatch) =
-        factos_pog.new_dispatch_builder(
+        factos_pog.new_dispatch(
           connection: connection,
           stream: "user-lucy",
           decider: decider(),
@@ -374,7 +374,7 @@ pub fn dispatch_builder_with_reactor_persists_and_leases_outbox_test_() -> Timeo
       reset_schema(connection)
 
       let assert Ok(dispatch) =
-        factos_pog.new_dispatch_builder(
+        factos_pog.new_dispatch(
           connection: connection,
           stream: "user-renata",
           decider: decider(),
@@ -441,7 +441,7 @@ fn start_blocked_dispatch_worker(
 ) -> process.Pid {
   process.spawn(fn() {
     let result =
-      factos_pog.new_dispatch_builder(
+      factos_pog.new_dispatch(
         connection: connection,
         stream: stream_name,
         decider: blocking_decider(messages, worker: worker),
@@ -462,7 +462,7 @@ fn start_blocked_query_dispatch_worker(
 ) -> process.Pid {
   process.spawn(fn() {
     let result =
-      factos_pog.new_dispatch_builder(
+      factos_pog.new_dispatch(
         connection: connection,
         stream: stream_name,
         decider: blocking_decider(messages, worker: worker),
@@ -751,7 +751,7 @@ fn dispatch_counter_context_many(
 ) -> Result(factos_pog.Dispatch(CounterEvent), factos_pog.Error(Nil)) {
   case remaining {
     0 ->
-      factos_pog.new_dispatch_builder(
+      factos_pog.new_dispatch(
         connection: connection,
         stream: "counter-context-0",
         decider: counter_decider(),
@@ -762,7 +762,7 @@ fn dispatch_counter_context_many(
     _ -> {
       let stream_name = "counter-context-" <> int.to_string(remaining)
       let result =
-        factos_pog.new_dispatch_builder(
+        factos_pog.new_dispatch(
           connection: connection,
           stream: stream_name,
           decider: counter_decider(),
