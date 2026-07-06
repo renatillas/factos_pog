@@ -17,9 +17,9 @@ import testcontainer
 import testcontainer/error as testcontainer_error
 import testcontainer_formulas/postgres
 
-const workers = 8
+const workers = 16
 
-const operations_per_worker = 5
+const operations_per_worker = 3
 
 pub fn main() -> Nil {
   let assert Ok(Nil) = run()
