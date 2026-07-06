@@ -63,6 +63,17 @@ pub type EventCodec(event) {
   /// `encode` converts a domain event into bytes and metadata. `decode` converts a
   /// stored row back into a `factos.Decoded` domain event. Decode failures are kept
   /// in the application's own error type and wrapped as `DecodeError`.
+  ///
+  /// WARNING: codecs used by dispatch must be pure.
+  ///
+  /// Serializable dispatch can retry the same command after a transaction
+  /// conflict. That can call `encode` and `decode` more than once for the same
+  /// logical operation, so codec functions must not perform IO, mutate external
+  /// state, allocate ids from an external system, publish messages, or otherwise
+  /// create host-system side effects.
+  ///
+  /// Return deterministic stored bytes and metadata from input values only. Put
+  /// external effects in durable outbox records and execute them after commit.
   EventCodec(
     encode: fn(event) -> Proposed(event),
     decode: fn(StoredEvent) -> Result(factos.Decoded(event), DecodeError),
@@ -106,6 +117,14 @@ pub type ProposedEffect(effect) {
 
 pub type EffectCodec(effect) {
   /// Application-owned outbox effect codec.
+  ///
+  /// WARNING: effect codecs used by dispatch must be pure.
+  ///
+  /// Serializable dispatch can retry the same command after a transaction
+  /// conflict. That can call `encode` more than once for the same effect value,
+  /// so this function must only convert an effect into a deterministic durable
+  /// outbox envelope. It must not execute the effect, publish messages, call
+  /// external services, mutate state, or allocate externally-visible ids.
   EffectCodec(encode: fn(effect) -> ProposedEffect(effect))
 }
 
@@ -138,6 +157,18 @@ type DispatchEffects(event, effect) {
 ///
 /// By default the builder uses one-stream consistency, no reactor effects, and
 /// 100 attempts for retryable serializable transaction conflicts.
+///
+/// WARNING: every function passed into dispatch must be pure.
+///
+/// Dispatch runs inside retryable serializable transactions. When PostgreSQL
+/// reports a retryable conflict, Factos may call the decider, codec, query
+/// evolve function, and reactor derivation more than once for the same command.
+/// Any side effect performed by those functions can therefore happen multiple
+/// times in the host system.
+///
+/// Keep command handling, event encoding and decoding, state evolution, and
+/// reactor derivation deterministic and side-effect free. Put external effects
+/// in durable outbox records and execute them after the transaction commits.
 pub fn new_dispatch(
   connection connection: pog.Connection,
   stream stream_name: String,
@@ -339,6 +370,11 @@ type QueryParameter {
 /// `encode` turns a domain event into a `Proposed` event ready for persistence.
 /// `decode` turns a stored row back into a domain event. Decode failures are
 /// returned as `DecodeError` and stop load/read flows rather than panicking.
+///
+/// WARNING: codecs used by dispatch must be pure. Serializable dispatch may
+/// retry and call `encode` or `decode` more than once for the same logical
+/// operation. Codec functions must be deterministic conversions only; external
+/// side effects belong in durable outbox records after commit.
 pub fn codec(
   encode encode: fn(event) -> Proposed(event),
   decode decode: fn(StoredEvent) -> Result(factos.Decoded(event), DecodeError),
@@ -347,6 +383,11 @@ pub fn codec(
 }
 
 /// Create an effect codec.
+///
+/// WARNING: effect codecs used by dispatch must be pure. Serializable dispatch
+/// may retry and call `encode` more than once for the same effect value. This
+/// function must only build a deterministic durable outbox envelope; it must not
+/// execute the effect or perform any other host-system side effect.
 pub fn effect_codec(
   encode encode: fn(effect) -> ProposedEffect(effect),
 ) -> EffectCodec(effect) {
@@ -655,7 +696,7 @@ fn set_serializable_isolation(
 ) -> Result(Nil, Error(_)) {
   pog.query("set transaction isolation level serializable")
   |> pog.execute(on: connection)
-  |> result.map(fn(_) { Nil })
+  |> result.map(nil_constant)
   |> result.map_error(StoreError)
 }
 
@@ -900,7 +941,7 @@ fn insert_outbox_effect(
   |> pog.parameter(pog.text(metadata_to_text(metadata)))
   |> pog.parameter(pog.bytea(payload))
   |> pog.execute(on: connection)
-  |> result.map(fn(_) { Nil })
+  |> result.map(nil_constant)
   |> result.map_error(StoreError)
 }
 
@@ -1344,7 +1385,7 @@ pub fn ack_outbox(
   )
   |> pog.parameter(pog.int(id))
   |> pog.execute(on: connection)
-  |> result.map(fn(_) { Nil })
+  |> result.map(nil_constant)
   |> result.map_error(StoreError)
 }
 
@@ -1368,7 +1409,7 @@ pub fn nack_outbox(
   |> pog.parameter(pog.text(error))
   |> pog.parameter(pog.int(retry_after_milliseconds))
   |> pog.execute(on: connection)
-  |> result.map(fn(_) { Nil })
+  |> result.map(nil_constant)
   |> result.map_error(StoreError)
 }
 
@@ -1475,4 +1516,8 @@ fn query_error_to_string(error: pog.QueryError) -> String {
     pog.QueryTimeout -> "query timeout"
     pog.ConnectionUnavailable -> "connection unavailable"
   }
+}
+
+fn nil_constant(_) {
+  Nil
 }
