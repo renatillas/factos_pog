@@ -252,6 +252,14 @@ pub fn migrate(connection: pog.Connection) -> Result(Nil, Error(_)) {
   use _ <- result.try(execute_migration(
     connection,
     "
+    create table if not exists factos_locks (
+      lock_key text primary key
+    )
+    ",
+  ))
+  use _ <- result.try(execute_migration(
+    connection,
+    "
     create table if not exists factos_outbox (
       id bigint generated always as identity primary key,
       source_position bigint not null references factos_events(position),
@@ -277,8 +285,9 @@ pub fn migrate(connection: pog.Connection) -> Result(Nil, Error(_)) {
   use _ <- result.try(execute_migration(
     connection,
     "
-    create index if not exists factos_outbox_pending
-      on factos_outbox(status, available_at, id)
+    create index if not exists factos_outbox_lease_pending
+      on factos_outbox(consumer, target, available_at, id)
+      where status = 'pending'
     ",
   ))
   Ok(Nil)
@@ -364,15 +373,14 @@ pub fn read_events_after(
 
 /// Run a full context-first read-decide-append command flow.
 ///
-/// PostgreSQL does not have a native primitive for "append if no row matching this
 /// arbitrary event-type/tag query appeared after position N". This backend uses a
-/// transaction plus `lock table factos_events in exclusive mode` to make the read,
-/// context check, and append atomic for all Factos queries.
+/// transaction plus a row lock in `factos_locks` to make the read, context
+/// check, and append atomic for all Factos dispatches.
 ///
-/// That lock is the main throughput tradeoff: unrelated writers queue behind each
-/// other even if their contexts do not overlap. It is deliberately simple and
-/// correct. A future backend can use advisory locks or query-specific lock keys,
-/// but only if it keeps the same context-stability guarantee.
+/// The lock row deliberately serializes dispatches to preserve context-stability
+/// for arbitrary queries, but it avoids PostgreSQL's heavyweight table lock on
+/// `factos_events`. Plain readers and maintenance queries are no longer blocked
+/// by command dispatch.
 pub fn dispatch_with_query(
   connection: pog.Connection,
   stream stream_name: String,
@@ -514,12 +522,7 @@ fn run_locked_transaction(
   case
     {
       use transaction_connection <- pog.transaction(connection)
-      use _ <- result.try(
-        pog.query("lock table factos_events in exclusive mode")
-        |> pog.execute(on: transaction_connection)
-        |> result.map(fn(_) { Nil })
-        |> result.map_error(StoreError),
-      )
+      use _ <- result.try(lock_event_dispatch(transaction_connection))
       work(transaction_connection)
     }
   {
@@ -527,6 +530,34 @@ fn run_locked_transaction(
     Error(pog.TransactionQueryError(error)) -> Error(StoreError(error))
     Error(pog.TransactionRolledBack(error)) -> Error(error)
   }
+}
+
+fn lock_event_dispatch(connection: pog.Connection) -> Result(Nil, Error(_)) {
+  use _ <- result.try(
+    pog.query(
+      "
+      insert into factos_locks (lock_key)
+      values ('event_dispatch')
+      on conflict (lock_key) do nothing
+      ",
+    )
+    |> pog.execute(on: connection)
+    |> result.map_error(StoreError),
+  )
+  use _ <- result.try(
+    pog.query(
+      "
+      select lock_key
+      from factos_locks
+      where lock_key = 'event_dispatch'
+      for update
+      ",
+    )
+    |> pog.returning(text_field_decoder())
+    |> pog.execute(on: connection)
+    |> result.map_error(StoreError),
+  )
+  Ok(Nil)
 }
 
 fn append_with_condition(
@@ -901,6 +932,11 @@ fn has_matching_events_after(
 
 fn int_field_decoder() -> decode.Decoder(Int) {
   use value <- decode.field(0, decode.int)
+  decode.success(value)
+}
+
+fn text_field_decoder() -> decode.Decoder(String) {
+  use value <- decode.field(0, decode.string)
   decode.success(value)
 }
 

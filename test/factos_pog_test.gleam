@@ -1,6 +1,7 @@
 import factos
 import factos/factos_pog
 import gleam/bit_array
+import gleam/dynamic/decode as dynamic_decode
 import gleam/erlang/application
 import gleam/erlang/process
 import gleam/int
@@ -100,6 +101,32 @@ pub fn dispatch_alias_persists_events_test_() -> Timeout(Nil) {
 
       assert loaded.state == Taken
       assert loaded.revision == factos.CurrentRevision(0)
+      Nil
+    })
+  Nil
+}
+
+pub fn dispatch_creates_factos_locks_row_test_() -> Timeout(Nil) {
+  use <- Timeout(120)
+  let assert Ok(Nil) =
+    with_test_connection(fn(connection) {
+      reset_schema(connection)
+      assert factos_lock_keys(connection) == Ok([])
+
+      let assert Ok(dispatch) =
+        factos_pog.dispatch(
+          connection,
+          stream: "row-lock-renata",
+          decider: decider(),
+          codec: codec(),
+          command: RegisterUser(username: "renata"),
+        )
+
+      let assert factos_pog.Append(
+        current_revision: 0,
+        position: factos.SequencePosition(_),
+      ) = dispatch.append
+      assert factos_lock_keys(connection) == Ok(["event_dispatch"])
       Nil
     })
   Nil
@@ -357,6 +384,9 @@ fn reset_schema(connection: pog.Connection) -> Nil {
   let assert Ok(_) =
     pog.query("drop table if exists factos_events")
     |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query("drop table if exists factos_locks")
+    |> pog.execute(on: connection)
   execute_migration_file(connection)
 }
 
@@ -375,6 +405,26 @@ fn execute_migration_file(connection: pog.Connection) -> Nil {
       }
     }
   })
+}
+
+fn factos_lock_keys(
+  connection: pog.Connection,
+) -> Result(List(String), pog.QueryError) {
+  pog.query(
+    "
+    select lock_key
+    from factos_locks
+    order by lock_key
+    ",
+  )
+  |> pog.returning(text_field_decoder())
+  |> pog.execute(on: connection)
+  |> result.map(fn(returned) { returned.rows })
+}
+
+fn text_field_decoder() -> dynamic_decode.Decoder(String) {
+  use value <- dynamic_decode.field(0, dynamic_decode.string)
+  dynamic_decode.success(value)
 }
 
 fn insert_unknown_event(connection: pog.Connection) -> Nil {

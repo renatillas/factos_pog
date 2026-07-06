@@ -36,6 +36,10 @@ cross join lateral regexp_split_to_table(factos_events.tags, E'\n') as split_tag
 where split_tags.tag <> ''
 on conflict do nothing;
 
+create table if not exists factos_locks (
+  lock_key text primary key
+);
+
 create table if not exists factos_outbox (
   id bigint generated always as identity primary key,
   source_position bigint not null references factos_events(position),
@@ -57,5 +61,6 @@ create table if not exists factos_outbox (
   unique(consumer, effect_key)
 );
 
-create index if not exists factos_outbox_pending
-  on factos_outbox(status, available_at, id);
+create index if not exists factos_outbox_lease_pending
+  on factos_outbox(consumer, target, available_at, id)
+  where status = 'pending';
