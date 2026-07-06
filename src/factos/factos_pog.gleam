@@ -109,6 +109,189 @@ pub type EffectCodec(effect) {
   EffectCodec(encode: fn(effect) -> ProposedEffect(effect))
 }
 
+pub opaque type DispatchBuilder(command, state, event, domain_error, effect) {
+  DispatchBuilder(
+    connection: pog.Connection,
+    stream: String,
+    query: DispatchQuery,
+    decider: factos.Decider(command, state, event, domain_error),
+    event_codec: EventCodec(event),
+    effects: DispatchEffects(event, effect),
+    retry_attempts: Int,
+  )
+}
+
+type DispatchQuery {
+  StreamQuery
+  ContextQuery(factos.Query)
+}
+
+type DispatchEffects(event, effect) {
+  NoEffects
+  ReactorEffects(
+    reactor: factos.Reactor(event, effect),
+    effect_codec: EffectCodec(effect),
+  )
+}
+
+/// Start building an event dispatch.
+///
+/// By default the builder uses one-stream consistency, no reactor effects, and
+/// 100 attempts for retryable serializable transaction conflicts.
+pub fn new_dispatch_builder(
+  connection connection: pog.Connection,
+  stream stream_name: String,
+  decider decider: factos.Decider(command, state, event, domain_error),
+  codec codec: EventCodec(event),
+) -> DispatchBuilder(command, state, event, domain_error, effect) {
+  DispatchBuilder(
+    connection: connection,
+    stream: stream_name,
+    query: StreamQuery,
+    decider: decider,
+    event_codec: codec,
+    effects: NoEffects,
+    retry_attempts: 5,
+  )
+}
+
+/// Use a context query instead of one-stream consistency.
+pub fn with_query(
+  builder: DispatchBuilder(command, state, event, domain_error, effect),
+  query query: factos.Query,
+) -> DispatchBuilder(command, state, event, domain_error, effect) {
+  let DispatchBuilder(
+    connection:,
+    stream:,
+    decider:,
+    event_codec:,
+    effects:,
+    retry_attempts:,
+    ..,
+  ) = builder
+  DispatchBuilder(
+    connection:,
+    stream:,
+    query: ContextQuery(query),
+    decider:,
+    event_codec:,
+    effects:,
+    retry_attempts:,
+  )
+}
+
+/// Persist reactor effects into the outbox in the same transaction as events.
+pub fn with_reactor(
+  builder: DispatchBuilder(command, state, event, domain_error, old_effect),
+  reactor reactor: factos.Reactor(event, effect),
+  codec effect_codec: EffectCodec(effect),
+) -> DispatchBuilder(command, state, event, domain_error, effect) {
+  let DispatchBuilder(
+    connection:,
+    stream:,
+    query:,
+    decider:,
+    event_codec:,
+    retry_attempts:,
+    ..,
+  ) = builder
+  DispatchBuilder(
+    connection:,
+    stream:,
+    query:,
+    decider:,
+    event_codec:,
+    effects: ReactorEffects(reactor:, effect_codec:),
+    retry_attempts:,
+  )
+}
+
+/// Override retry attempts for PostgreSQL serializable/deadlock conflicts.
+pub fn with_retry_attempts(
+  builder: DispatchBuilder(command, state, event, domain_error, effect),
+  attempts attempts: Int,
+) -> DispatchBuilder(command, state, event, domain_error, effect) {
+  let DispatchBuilder(
+    connection:,
+    stream:,
+    query:,
+    decider:,
+    event_codec:,
+    effects:,
+    ..,
+  ) = builder
+  DispatchBuilder(
+    connection:,
+    stream:,
+    query:,
+    decider:,
+    event_codec:,
+    effects:,
+    retry_attempts: int.max(attempts, 1),
+  )
+}
+
+/// Dispatch a command with a configured builder.
+pub fn dispatch(
+  builder: DispatchBuilder(command, state, event, domain_error, effect),
+  command: command,
+) -> Result(Dispatch(event), Error(domain_error)) {
+  let DispatchBuilder(
+    connection:,
+    stream:,
+    query:,
+    decider:,
+    event_codec:,
+    effects:,
+    retry_attempts:,
+  ) = builder
+
+  case query, effects {
+    StreamQuery, NoEffects ->
+      dispatch_stream(
+        connection,
+        stream:,
+        decider:,
+        codec: event_codec,
+        command:,
+        retry_attempts:,
+      )
+    ContextQuery(query), NoEffects ->
+      dispatch_query(
+        connection,
+        stream:,
+        query:,
+        decider:,
+        codec: event_codec,
+        command:,
+        retry_attempts:,
+      )
+    StreamQuery, ReactorEffects(reactor:, effect_codec:) ->
+      dispatch_stream_with_reactor(
+        connection,
+        stream:,
+        decider:,
+        event_codec:,
+        command:,
+        reactor:,
+        effect_codec:,
+        retry_attempts:,
+      )
+    ContextQuery(query), ReactorEffects(reactor:, effect_codec:) ->
+      dispatch_query_with_reactor(
+        connection,
+        stream:,
+        query:,
+        decider:,
+        event_codec:,
+        command:,
+        reactor:,
+        effect_codec:,
+        retry_attempts:,
+      )
+  }
+}
+
 pub type OutboxMessage {
   /// A leased outbox message ready for delivery by an application worker.
   OutboxMessage(
@@ -168,139 +351,6 @@ pub fn effect_codec(
   encode encode: fn(effect) -> ProposedEffect(effect),
 ) -> EffectCodec(effect) {
   EffectCodec(encode:)
-}
-
-/// Deprecated: read `priv/migrations.sql` from the `factos_pog` application
-/// with `gleam/erlang/application.priv_directory` and run it with your
-/// application's migration tool instead.
-/// The schema is an append-only `factos_events` table with a global identity
-/// `position`, per-stream `revision`, event `type`, newline-encoded `tags`, and
-/// opaque `data` bytes. Queryable tags are also mirrored into
-/// `factos_event_tags`, which gives event-type/tag context reads indexed SQL
-/// plans instead of loading the whole event table into the application.
-@deprecated("Use the SQL file at factos_pog/priv/migrations.sql instead.")
-pub fn migrate(connection: pog.Connection) -> Result(Nil, Error(_)) {
-  // `pog` uses prepared statements, and PostgreSQL does not allow multiple SQL
-  // commands in one prepared statement. Keep migrations split into individual
-  // statements rather than relying on client-side SQL script execution.
-  use _ <- result.try(execute_migration(
-    connection,
-    "
-    create table if not exists factos_events (
-      position bigint generated always as identity primary key,
-      id text not null,
-      stream text not null,
-      revision integer not null,
-      type text not null,
-      version integer not null,
-      tags text not null,
-      metadata text not null,
-      data bytea not null,
-      unique(stream, revision)
-    )
-    ",
-  ))
-  use _ <- result.try(execute_migration(
-    connection,
-    "
-    create index if not exists factos_events_stream_revision
-      on factos_events(stream, revision)
-    ",
-  ))
-  use _ <- result.try(execute_migration(
-    connection,
-    "
-    create index if not exists factos_events_position
-      on factos_events(position)
-    ",
-  ))
-  use _ <- result.try(execute_migration(
-    connection,
-    "
-    create table if not exists factos_event_tags (
-      position bigint not null references factos_events(position) on delete cascade,
-      tag text not null,
-      primary key(position, tag)
-    )
-    ",
-  ))
-  use _ <- result.try(execute_migration(
-    connection,
-    "
-    create index if not exists factos_events_type_position
-      on factos_events(type, position)
-    ",
-  ))
-  use _ <- result.try(execute_migration(
-    connection,
-    "
-    create index if not exists factos_event_tags_tag_position
-      on factos_event_tags(tag, position)
-    ",
-  ))
-  use _ <- result.try(execute_migration(
-    connection,
-    "
-    insert into factos_event_tags(position, tag)
-    select factos_events.position, split_tags.tag
-    from factos_events
-    cross join lateral regexp_split_to_table(factos_events.tags, E'\\n') as split_tags(tag)
-    where split_tags.tag <> ''
-    on conflict do nothing
-    ",
-  ))
-  use _ <- result.try(execute_migration(
-    connection,
-    "
-    create table if not exists factos_locks (
-      lock_key text primary key
-    )
-    ",
-  ))
-  use _ <- result.try(execute_migration(
-    connection,
-    "
-    create table if not exists factos_outbox (
-      id bigint generated always as identity primary key,
-      source_position bigint not null references factos_events(position),
-      source_event_id text not null,
-      source_context text not null,
-      consumer text not null,
-      effect_key text not null,
-      target text not null,
-      type text not null,
-      metadata text not null,
-      payload bytea not null,
-      status text not null default 'pending',
-      attempts integer not null default 0,
-      available_at timestamptz not null default now(),
-      locked_until timestamptz,
-      last_error text,
-      created_at timestamptz not null default now(),
-      delivered_at timestamptz,
-      unique(consumer, effect_key)
-    )
-    ",
-  ))
-  use _ <- result.try(execute_migration(
-    connection,
-    "
-    create index if not exists factos_outbox_lease_pending
-      on factos_outbox(consumer, target, available_at, id)
-      where status = 'pending'
-    ",
-  ))
-  Ok(Nil)
-}
-
-fn execute_migration(
-  connection: pog.Connection,
-  sql: String,
-) -> Result(Nil, Error(_)) {
-  pog.query(sql)
-  |> pog.execute(on: connection)
-  |> result.map(fn(_) { Nil })
-  |> result.map_error(StoreError)
 }
 
 /// Read and fold the facts selected by a command-context query.
@@ -371,25 +421,19 @@ pub fn read_events_after(
   }
 }
 
-/// Run a full context-first read-decide-append command flow.
-///
-/// arbitrary event-type/tag query appeared after position N". This backend uses a
-/// transaction plus a row lock in `factos_locks` to make the read, context
-/// check, and append atomic for all Factos dispatches.
-///
-/// The lock row deliberately serializes dispatches to preserve context-stability
-/// for arbitrary queries, but it avoids PostgreSQL's heavyweight table lock on
-/// `factos_events`. Plain readers and maintenance queries are no longer blocked
-/// by command dispatch.
-pub fn dispatch_with_query(
+fn dispatch_query(
   connection: pog.Connection,
   stream stream_name: String,
   query query: factos.Query,
   decider decider: factos.Decider(command, state, event, domain_error),
   codec codec: EventCodec(event),
   command command: command,
+  retry_attempts retry_attempts: Int,
 ) -> Result(Dispatch(event), Error(domain_error)) {
-  use transaction_connection <- run_locked_transaction(connection)
+  use transaction_connection <- run_serializable_transaction(
+    connection,
+    retry_attempts,
+  )
   use context <- result.try(read_context(
     transaction_connection,
     query: query,
@@ -411,12 +455,7 @@ pub fn dispatch_with_query(
   )
 }
 
-/// Run a context-first command and durably persist reactor effects atomically.
-///
-/// Effects are inserted into `factos_outbox` in the same transaction as the
-/// domain events that produced them. If effect persistence fails, the event
-/// append rolls back too.
-pub fn dispatch_with_reactor(
+fn dispatch_query_with_reactor(
   connection: pog.Connection,
   stream stream_name: String,
   query query: factos.Query,
@@ -425,8 +464,12 @@ pub fn dispatch_with_reactor(
   command command: command,
   reactor reactor: factos.Reactor(event, effect),
   effect_codec effect_codec: EffectCodec(effect),
+  retry_attempts retry_attempts: Int,
 ) -> Result(Dispatch(event), Error(domain_error)) {
-  use transaction_connection <- run_locked_transaction(connection)
+  use transaction_connection <- run_serializable_transaction(
+    connection,
+    retry_attempts,
+  )
   use context <- result.try(read_context(
     transaction_connection,
     query: query,
@@ -481,19 +524,18 @@ pub fn load_stream(
   ))
 }
 
-/// Run a stream-based read-decide-append command flow.
-///
-/// Use this when one stream is intentionally the consistency boundary. It remains
-/// useful, but it is not required by Event Sourcing. For command-specific rules,
-/// prefer `dispatch_with_query` so the protected boundary follows the decision.
-pub fn dispatch(
+fn dispatch_stream(
   connection: pog.Connection,
   stream stream_name: String,
   decider decider: factos.Decider(command, state, event, domain_error),
   codec codec: EventCodec(event),
   command command: command,
+  retry_attempts retry_attempts: Int,
 ) -> Result(Dispatch(event), Error(domain_error)) {
-  use transaction_connection <- run_locked_transaction(connection)
+  use transaction_connection <- run_serializable_transaction(
+    connection,
+    retry_attempts,
+  )
   use loaded <- result.try(load_stream(
     transaction_connection,
     stream: stream_name,
@@ -515,14 +557,90 @@ pub fn dispatch(
   )
 }
 
-fn run_locked_transaction(
+fn dispatch_stream_with_reactor(
+  connection: pog.Connection,
+  stream stream_name: String,
+  decider decider: factos.Decider(command, state, event, domain_error),
+  event_codec event_codec: EventCodec(event),
+  command command: command,
+  reactor reactor: factos.Reactor(event, effect),
+  effect_codec effect_codec: EffectCodec(effect),
+  retry_attempts retry_attempts: Int,
+) -> Result(Dispatch(event), Error(domain_error)) {
+  use transaction_connection <- run_serializable_transaction(
+    connection,
+    retry_attempts,
+  )
+  use loaded <- result.try(load_stream(
+    transaction_connection,
+    stream: stream_name,
+    decider: decider,
+    codec: event_codec,
+  ))
+  let factos.Decider(_, decide, _) = decider
+  use events <- result.try(
+    decide(loaded.state, command)
+    |> result.map_error(DomainError),
+  )
+  use dispatch <- result.try(append_stream_events(
+    transaction_connection,
+    stream_name,
+    events,
+    event_codec,
+    loaded.revision,
+  ))
+  use _ <- result.try(insert_outbox_effects(
+    transaction_connection,
+    dispatch.events,
+    reactor,
+    effect_codec,
+  ))
+
+  Ok(dispatch)
+}
+
+fn run_serializable_transaction(
+  connection: pog.Connection,
+  retry_attempts: Int,
+  work: fn(pog.Connection) -> Result(Dispatch(event), Error(domain_error)),
+) -> Result(Dispatch(event), Error(domain_error)) {
+  run_serializable_transaction_attempt(
+    connection,
+    work,
+    attempts_remaining: retry_attempts,
+  )
+}
+
+fn run_serializable_transaction_attempt(
+  connection: pog.Connection,
+  work: fn(pog.Connection) -> Result(Dispatch(event), Error(domain_error)),
+  attempts_remaining attempts_remaining: Int,
+) -> Result(Dispatch(event), Error(domain_error)) {
+  let result = run_serializable_transaction_once(connection, work)
+  case result {
+    Ok(dispatch) -> Ok(dispatch)
+    Error(error) -> {
+      case attempts_remaining > 1 && retryable_transaction_error(error) {
+        True ->
+          run_serializable_transaction_attempt(
+            connection,
+            work,
+            attempts_remaining: attempts_remaining - 1,
+          )
+        False -> Error(error)
+      }
+    }
+  }
+}
+
+fn run_serializable_transaction_once(
   connection: pog.Connection,
   work: fn(pog.Connection) -> Result(Dispatch(event), Error(domain_error)),
 ) -> Result(Dispatch(event), Error(domain_error)) {
   case
     {
       use transaction_connection <- pog.transaction(connection)
-      use _ <- result.try(lock_event_dispatch(transaction_connection))
+      use _ <- result.try(set_serializable_isolation(transaction_connection))
       work(transaction_connection)
     }
   {
@@ -532,32 +650,21 @@ fn run_locked_transaction(
   }
 }
 
-fn lock_event_dispatch(connection: pog.Connection) -> Result(Nil, Error(_)) {
-  use _ <- result.try(
-    pog.query(
-      "
-      insert into factos_locks (lock_key)
-      values ('event_dispatch')
-      on conflict (lock_key) do nothing
-      ",
-    )
-    |> pog.execute(on: connection)
-    |> result.map_error(StoreError),
-  )
-  use _ <- result.try(
-    pog.query(
-      "
-      select lock_key
-      from factos_locks
-      where lock_key = 'event_dispatch'
-      for update
-      ",
-    )
-    |> pog.returning(text_field_decoder())
-    |> pog.execute(on: connection)
-    |> result.map_error(StoreError),
-  )
-  Ok(Nil)
+fn set_serializable_isolation(
+  connection: pog.Connection,
+) -> Result(Nil, Error(_)) {
+  pog.query("set transaction isolation level serializable")
+  |> pog.execute(on: connection)
+  |> result.map(fn(_) { Nil })
+  |> result.map_error(StoreError)
+}
+
+fn retryable_transaction_error(error: Error(_)) -> Bool {
+  case error {
+    StoreError(pog.PostgresqlError(code: "40001", ..)) -> True
+    StoreError(pog.PostgresqlError(code: "40P01", ..)) -> True
+    _ -> False
+  }
 }
 
 fn append_with_condition(
@@ -637,6 +744,14 @@ fn append_stream_events(
   }
 }
 
+fn map_event_insert_error(error: pog.QueryError) -> Error(domain_error) {
+  case error {
+    pog.ConstraintViolated(constraint: "factos_events_stream_revision_key", ..) ->
+      AppendConditionFailed(factos.NoAppendCondition)
+    _ -> StoreError(error)
+  }
+}
+
 fn insert_events(
   connection: pog.Connection,
   stream_name: String,
@@ -672,7 +787,7 @@ fn insert_events(
         |> pog.parameter(pog.bytea(data))
         |> pog.returning(int_field_decoder())
         |> pog.execute(on: connection)
-        |> result.map_error(StoreError),
+        |> result.map_error(map_event_insert_error),
       )
       let position = case returned.rows {
         [position, ..] -> factos.SequencePosition(position)
@@ -909,6 +1024,9 @@ fn current_revision(
   }
 }
 
+// This is a validation query, not a lock. PostgreSQL `SERIALIZABLE` isolation
+// detects concurrent predicate changes and returns a retryable serialization
+// failure when another committed transaction invalidates this command's context.
 fn has_matching_events_after(
   connection: pog.Connection,
   query: factos.Query,
@@ -932,11 +1050,6 @@ fn has_matching_events_after(
 
 fn int_field_decoder() -> decode.Decoder(Int) {
   use value <- decode.field(0, decode.int)
-  decode.success(value)
-}
-
-fn text_field_decoder() -> decode.Decoder(String) {
-  use value <- decode.field(0, decode.string)
   decode.success(value)
 }
 

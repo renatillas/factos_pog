@@ -111,32 +111,40 @@ fn decode_event(
 Tags are the query contract. If future commands need to find an event by payload
 value, expose that value as a tag when writing the event.
 
-## Dispatch by context query
+## Dispatch commands
 
-`dispatch_with_query` is the primary context-first write API.
+`dispatch` is the single write API. Build a dispatch with the required stream,
+decider, and codec, then add a context query, reactor, or retry configuration
+only when that command needs them. Pass the command as the second argument to
+`dispatch`.
 
 ```gleam
-let assert Ok(dispatch) =
-  factos_pog.dispatch_with_query(
-    connection,
+let builder =
+  factos_pog.new_dispatch_builder(
+    connection: connection,
     stream: buyer_stream(attempt),
-    query: sale_query(),
     decider: ticket_decider(),
     codec: ticket_codec(),
-    command: BuyTicket(buyer_name(attempt)),
   )
+  |> factos_pog.with_query(query: sale_query())
+
+let assert Ok(dispatch) = factos_pog.dispatch(builder, BuyTicket(buyer_name(attempt)))
 ```
 
 The backend:
 
-1. opens a PostgreSQL transaction;
-2. locks `factos_events` in exclusive mode;
-3. reads rows matching the query;
-4. decodes and folds them into decision state;
-5. runs the decider;
-6. checks that no matching row appeared after the observed position;
-7. inserts the new events;
-8. returns append metadata and committed records.
+1. opens a PostgreSQL `SERIALIZABLE` transaction;
+2. reads rows matching the builder's query, or the builder's stream when no
+   query is configured;
+3. decodes and folds them into decision state;
+4. runs the decider;
+5. appends only if PostgreSQL accepts the serializable transaction and any
+   stream revision check still holds;
+6. inserts the new events and tag-index rows;
+7. inserts outbox effects if the builder has a reactor;
+8. retries retryable serialization/deadlock failures up to the builder's retry
+   attempts;
+9. returns append metadata and committed records.
 
 The return type is:
 
@@ -149,23 +157,25 @@ pub type Dispatch(event) {
 `dispatch.events` contains the committed records inserted by this dispatch. Use
 those records for reactors or durable effect adapters.
 
-## Dispatch by stream
+## Stream-only dispatch
 
-`dispatch` is also available when one stream revision is intentionally the
-consistency boundary:
+Leave the query unset when one stream revision is intentionally the consistency
+boundary:
 
 ```gleam
-factos_pog.dispatch(
-  connection,
-  stream: "ticket-sale-renata",
-  decider: ticket_decider(),
-  codec: ticket_codec(),
-  command: BuyTicket("renata"),
-)
+let assert Ok(dispatch) =
+  factos_pog.new_dispatch_builder(
+    connection: connection,
+    stream: "ticket-sale-renata",
+    decider: ticket_decider(),
+    codec: ticket_codec(),
+  )
+  |> factos_pog.dispatch(BuyTicket("renata"))
 ```
 
-Stream dispatch remains useful for stream-shaped rules, but context dispatch is
-the better fit when a command depends on facts selected by event type and tag.
+Stream-only dispatch remains useful for stream-shaped rules, but a builder with
+`with_query` is the better fit when a command depends on facts selected by event
+type and tag.
 
 ## React after commit
 
@@ -201,5 +211,6 @@ docker compose up -d
 gleam run
 ```
 
-The example uses `dispatch_with_query` to protect a capacity rule across many
-buyer streams. It then runs a reactor over the committed `TicketSold` records.
+The example uses a dispatch builder with `with_query` to protect a capacity rule
+across many buyer streams. It then runs a reactor over the committed
+`TicketSold` records.

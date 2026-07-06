@@ -17,9 +17,9 @@ import testcontainer
 import testcontainer/error as testcontainer_error
 import testcontainer_formulas/postgres
 
-const workers = 16
+const workers = 40
 
-const operations_per_worker = 3
+const operations_per_worker = 5
 
 pub fn main() -> Nil {
   let assert Ok(Nil) = run()
@@ -27,7 +27,7 @@ pub fn main() -> Nil {
 }
 
 fn run() -> Result(Nil, testcontainer_error.Error) {
-  io.println("factos_pog row-lock benchmark")
+  io.println("factos_pog serializable dispatch benchmark")
   io.println(
     "Each benchmark iteration dispatches "
     <> int.to_string(workers * operations_per_worker)
@@ -46,7 +46,7 @@ fn run() -> Result(Nil, testcontainer_error.Error) {
       bench.SetupFunction("sequential dispatch", setup_sequential),
       bench.SetupFunction("concurrent dispatch", setup_concurrent),
     ],
-    [bench.Duration(400), bench.Warmup(50), bench.Decimals(2)],
+    [],
   )
   |> bench.table([bench.IPS, bench.Min, bench.Mean, bench.P(99)])
   |> io.println
@@ -196,8 +196,15 @@ fn wait_for_workers(
       case message {
         WorkerDone(worker: _, result: Ok(Nil)) ->
           wait_for_workers(subject, remaining - 1)
-        WorkerDone(worker: _, result: Error(_)) ->
+        WorkerDone(worker:, result: Error(error)) -> {
+          io.println(
+            "benchmark worker "
+            <> int.to_string(worker)
+            <> " failed: "
+            <> factos_pog.error_to_string(error, fn(_) { "nil" }),
+          )
           panic as "benchmark worker failed"
+        }
       }
     }
   }
@@ -224,13 +231,14 @@ fn dispatch_once(
   connection: pog.Connection,
   stream_name: String,
 ) -> Result(factos_pog.Dispatch(Event), factos_pog.Error(Nil)) {
-  factos_pog.dispatch(
-    connection,
+  factos_pog.new_dispatch_builder(
+    connection: connection,
     stream: stream_name,
     decider: decider(),
     codec: codec(),
-    command: Increment,
   )
+  |> factos_pog.with_retry_attempts(100)
+  |> factos_pog.dispatch(Increment)
 }
 
 fn decider() -> factos.Decider(Command, State, Event, Nil) {

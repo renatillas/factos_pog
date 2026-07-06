@@ -2,17 +2,16 @@
 
 `factos_pog` is a PostgreSQL event-store backend for the Factos core model.
 
-It implements two write paths:
+It exposes one write path: build a `DispatchBuilder` and pass it to
+`factos_pog.dispatch`. The builder can protect either:
 
-- `dispatch_with_query`: protect an arbitrary Factos event-type/tag context;
-- `dispatch`: protect one stream revision.
+- one stream revision, when no query is configured;
+- an arbitrary Factos event-type/tag context, when `with_query` is used.
 
-It persists event records only. Views are computed by application folds over
-events, and durable materialized views are application-owned tables or stores.
-Reactors produce effect values, but this package does not execute or retry those
-effects.
+The builder can also attach a reactor with `with_reactor`, causing produced
+effects to be inserted into `factos_outbox` atomically with the events.
 
-Both paths return `Dispatch(event)`, which includes append metadata and the
+`dispatch` returns `Dispatch(event)`, which includes append metadata and the
 committed `factos.Recorded(event)` values inserted by the dispatch.
 
 ## Event rows
@@ -34,44 +33,33 @@ The append-only table is `factos_events`:
 Tags are also mirrored into `factos_event_tags(position, tag)`. This table gives
 PostgreSQL indexed predicates for context queries.
 
-## Context dispatch flow
+## Dispatch flow
 
-`dispatch_with_query` is for commands whose consistency boundary is a
-`factos.Query`.
+A builder without `with_query` is for commands whose consistency boundary is one
+stream. A builder with `with_query` is for commands whose consistency boundary is
+a `factos.Query`.
 
-The transaction does this:
+The serializable transaction does this:
 
-1. lock `factos_events` in exclusive mode;
-2. select candidate rows with SQL generated from the query;
-3. decode candidate rows using the application codec;
-4. apply `factos.matches_query` semantics;
-5. fold events with the decider's `evolve` function;
-6. run the decider with the command;
-7. check `FailIfEventsMatch(query, after)`;
-8. insert produced events;
-9. insert tag-index rows;
-10. return `Dispatch(event)`.
+1. select candidate rows from either the stream or the configured query;
+2. decode candidate rows using the application codec;
+3. fold events with the decider's `evolve` function;
+4. run the decider with the command;
+5. check the stream revision or `FailIfEventsMatch(query, after)`;
+6. insert produced events;
+7. insert tag-index rows;
+8. insert outbox effects when the builder has a reactor;
+9. return `Dispatch(event)`.
 
-The table lock is intentionally conservative. It is the simplest way to make the
-append condition correct for arbitrary query shapes.
+PostgreSQL `SERIALIZABLE` isolation detects concurrent predicate conflicts. The
+backend retries retryable serialization/deadlock failures according to the
+builder's retry attempts, so deciders and codecs must be pure/idempotent.
 
-## Stream dispatch flow
+## Stream dispatch
 
-`dispatch` is for commands whose consistency boundary is one stream.
-
-The backend:
-
-1. loads the stream ordered by revision;
-2. decodes rows;
-3. folds the stream state;
-4. runs the decider;
-5. checks that the stream revision still matches;
-6. inserts the produced events;
-7. returns `Dispatch(event)`.
-
-Use stream dispatch only when the business rule really is protected by one
-stream. If the rule needs event types and tags across streams, use
-`dispatch_with_query`.
+Stream-only dispatch remains useful when the business rule really is protected
+by one stream. If the rule needs event types and tags across streams, add
+`with_query` to the builder.
 
 ## Codec boundary
 

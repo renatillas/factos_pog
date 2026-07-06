@@ -1,7 +1,6 @@
 import factos
 import factos/factos_pog
 import gleam/bit_array
-import gleam/dynamic/decode as dynamic_decode
 import gleam/erlang/application
 import gleam/erlang/process
 import gleam/int
@@ -58,20 +57,23 @@ pub type Timeout(a) {
   Timeout(time: Int, function: fn() -> a)
 }
 
-pub fn dispatch_alias_persists_events_test_() -> Timeout(Nil) {
+pub fn dispatch_builder_with_one_retry_attempt_persists_events_test_() -> Timeout(
+  Nil,
+) {
   use <- Timeout(120)
   let assert Ok(Nil) =
     with_test_connection(fn(connection) {
       reset_schema(connection)
 
       let assert Ok(dispatch) =
-        factos_pog.dispatch(
-          connection,
+        factos_pog.new_dispatch_builder(
+          connection: connection,
           stream: "user-renata",
           decider: decider(),
           codec: codec(),
-          command: RegisterUser("renata"),
         )
+        |> factos_pog.with_retry_attempts(attempts: 1)
+        |> factos_pog.dispatch(RegisterUser("renata"))
 
       let assert factos_pog.Append(
         current_revision: 0,
@@ -106,33 +108,110 @@ pub fn dispatch_alias_persists_events_test_() -> Timeout(Nil) {
   Nil
 }
 
-pub fn dispatch_creates_factos_locks_row_test_() -> Timeout(Nil) {
+pub fn concurrent_dispatch_same_stream_allows_one_empty_state_append_test_() -> Timeout(
+  Nil,
+) {
   use <- Timeout(120)
   let assert Ok(Nil) =
     with_test_connection(fn(connection) {
       reset_schema(connection)
-      assert factos_lock_keys(connection) == Ok([])
 
-      let assert Ok(dispatch) =
-        factos_pog.dispatch(
+      let messages = process.new_subject()
+      start_blocked_dispatch_worker(
+        connection,
+        messages: messages,
+        worker: "first",
+        stream: "concurrent-user-renata",
+        command: RegisterUser(username: "renata"),
+      )
+      start_blocked_dispatch_worker(
+        connection,
+        messages: messages,
+        worker: "second",
+        stream: "concurrent-user-renata",
+        command: RegisterUser(username: "renata"),
+      )
+
+      let first_release = receive_dispatch_ready(messages)
+      let second_release = receive_dispatch_ready(messages)
+      process.send(first_release, Nil)
+      let first_result = receive_dispatch_finished(messages)
+      process.send(second_release, Nil)
+      let second_result = receive_dispatch_finished(messages)
+      let results = [first_result, second_result]
+      assert list.count(results, where: is_successful_dispatch) == 1
+      assert list.count(results, where: is_stale_stream_dispatch) == 1
+
+      let assert Ok(loaded) =
+        factos_pog.load_stream(
           connection,
-          stream: "row-lock-renata",
+          stream: "concurrent-user-renata",
           decider: decider(),
           codec: codec(),
-          command: RegisterUser(username: "renata"),
         )
-
-      let assert factos_pog.Append(
-        current_revision: 0,
-        position: factos.SequencePosition(_),
-      ) = dispatch.append
-      assert factos_lock_keys(connection) == Ok(["event_dispatch"])
+      assert loaded.state == Taken
+      assert list.length(loaded.events) == 1
+      let assert [event] = loaded.events
+      assert event.event == UserRegistered("renata")
       Nil
     })
   Nil
 }
 
-pub fn dispatch_with_query_filters_before_decoding_unknown_events_test_() -> Timeout(
+pub fn concurrent_dispatch_with_query_retries_duplicate_username_test_() -> Timeout(
+  Nil,
+) {
+  use <- Timeout(120)
+  let assert Ok(Nil) =
+    with_test_connection(fn(connection) {
+      reset_schema(connection)
+
+      let query = username_query("renata")
+      let messages = process.new_subject()
+      start_blocked_query_dispatch_worker(
+        connection,
+        messages: messages,
+        worker: "first",
+        stream: "concurrent-query-renata-1",
+        query: query,
+        command: RegisterUser(username: "renata"),
+      )
+      start_blocked_query_dispatch_worker(
+        connection,
+        messages: messages,
+        worker: "second",
+        stream: "concurrent-query-renata-2",
+        query: query,
+        command: RegisterUser(username: "renata"),
+      )
+
+      let first_release = receive_dispatch_ready(messages)
+      let second_release = receive_dispatch_ready(messages)
+      process.send(first_release, Nil)
+      let first_result = receive_dispatch_finished(messages)
+      process.send(second_release, Nil)
+      let second_result = receive_dispatch_finished(messages)
+      let results = [first_result, second_result]
+      assert list.count(results, where: is_successful_dispatch) == 1
+      assert list.count(results, where: is_already_taken_dispatch) == 1
+
+      let assert Ok(context) =
+        factos_pog.read_context(
+          connection,
+          query: query,
+          decider: decider(),
+          codec: codec(),
+        )
+      assert context.state == Taken
+      assert list.length(context.events) == 1
+      let assert [event] = context.events
+      assert event.event == UserRegistered("renata")
+      Nil
+    })
+  Nil
+}
+
+pub fn dispatch_builder_with_query_filters_before_decoding_unknown_events_test_() -> Timeout(
   Nil,
 ) {
   use <- Timeout(120)
@@ -144,14 +223,14 @@ pub fn dispatch_with_query_filters_before_decoding_unknown_events_test_() -> Tim
       let query = username_query("renata")
 
       let assert Ok(dispatch) =
-        factos_pog.dispatch_with_query(
-          connection,
+        factos_pog.new_dispatch_builder(
+          connection: connection,
           stream: "user-renata",
-          query: query,
           decider: decider(),
           codec: codec(),
-          command: RegisterUser("renata"),
         )
+        |> factos_pog.with_query(query: query)
+        |> factos_pog.dispatch(RegisterUser("renata"))
 
       let assert factos_pog.Append(
         current_revision: 0,
@@ -188,7 +267,7 @@ pub fn dispatch_with_query_filters_before_decoding_unknown_events_test_() -> Tim
   Nil
 }
 
-pub fn dispatch_with_query_handles_many_streams_test_() -> Timeout(Nil) {
+pub fn dispatch_builder_with_query_handles_many_streams_test_() -> Timeout(Nil) {
   use <- Timeout(120)
   let assert Ok(Nil) =
     with_test_connection(fn(connection) {
@@ -250,24 +329,24 @@ pub fn read_events_after_returns_global_position_slice_test_() -> Timeout(Nil) {
           ]),
         ])
       let assert Ok(first_dispatch) =
-        factos_pog.dispatch_with_query(
-          connection,
+        factos_pog.new_dispatch_builder(
+          connection: connection,
           stream: "user-renata",
-          query: query,
           decider: decider(),
           codec: codec(),
-          command: RegisterUser("renata"),
         )
+        |> factos_pog.with_query(query: query)
+        |> factos_pog.dispatch(RegisterUser("renata"))
 
       let assert Ok(second_dispatch) =
-        factos_pog.dispatch_with_query(
-          connection,
+        factos_pog.new_dispatch_builder(
+          connection: connection,
           stream: "user-lucy",
-          query: username_query("lucy"),
           decider: decider(),
           codec: codec(),
-          command: RegisterUser("lucy"),
         )
+        |> factos_pog.with_query(query: username_query("lucy"))
+        |> factos_pog.dispatch(RegisterUser("lucy"))
 
       let assert Ok(events) =
         factos_pog.read_events_after(
@@ -286,23 +365,27 @@ pub fn read_events_after_returns_global_position_slice_test_() -> Timeout(Nil) {
   Nil
 }
 
-pub fn dispatch_with_reactor_persists_and_leases_outbox_test_() -> Timeout(Nil) {
+pub fn dispatch_builder_with_reactor_persists_and_leases_outbox_test_() -> Timeout(
+  Nil,
+) {
   use <- Timeout(120)
   let assert Ok(Nil) =
     with_test_connection(fn(connection) {
       reset_schema(connection)
 
       let assert Ok(dispatch) =
-        factos_pog.dispatch_with_reactor(
-          connection,
+        factos_pog.new_dispatch_builder(
+          connection: connection,
           stream: "user-renata",
-          query: username_query("renata"),
           decider: decider(),
-          event_codec: codec(),
-          command: RegisterUser("renata"),
-          reactor: welcome_reactor(),
-          effect_codec: effect_codec(),
+          codec: codec(),
         )
+        |> factos_pog.with_query(query: username_query("renata"))
+        |> factos_pog.with_reactor(
+          reactor: welcome_reactor(),
+          codec: effect_codec(),
+        )
+        |> factos_pog.dispatch(RegisterUser("renata"))
 
       let assert factos.SequencePosition(source_position) =
         dispatch.append.position
@@ -339,6 +422,129 @@ pub fn dispatch_with_reactor_persists_and_leases_outbox_test_() -> Timeout(Nil) 
       Nil
     })
   Nil
+}
+
+type DispatchMessage {
+  DispatchReady(worker: String, release: process.Subject(Nil))
+  DispatchFinished(
+    worker: String,
+    result: Result(factos_pog.Dispatch(Event), factos_pog.Error(DomainError)),
+  )
+}
+
+fn start_blocked_dispatch_worker(
+  connection: pog.Connection,
+  messages messages: process.Subject(DispatchMessage),
+  worker worker: String,
+  stream stream_name: String,
+  command command: Command,
+) -> process.Pid {
+  process.spawn(fn() {
+    let result =
+      factos_pog.new_dispatch_builder(
+        connection: connection,
+        stream: stream_name,
+        decider: blocking_decider(messages, worker: worker),
+        codec: codec(),
+      )
+      |> factos_pog.dispatch(command)
+    process.send(messages, DispatchFinished(worker: worker, result: result))
+  })
+}
+
+fn start_blocked_query_dispatch_worker(
+  connection: pog.Connection,
+  messages messages: process.Subject(DispatchMessage),
+  worker worker: String,
+  stream stream_name: String,
+  query query: factos.Query,
+  command command: Command,
+) -> process.Pid {
+  process.spawn(fn() {
+    let result =
+      factos_pog.new_dispatch_builder(
+        connection: connection,
+        stream: stream_name,
+        decider: blocking_decider(messages, worker: worker),
+        codec: codec(),
+      )
+      |> factos_pog.with_query(query: query)
+      |> factos_pog.dispatch(command)
+    process.send(messages, DispatchFinished(worker: worker, result: result))
+  })
+}
+
+fn blocking_decider(
+  messages: process.Subject(DispatchMessage),
+  worker worker: String,
+) -> factos.Decider(Command, State, Event, DomainError) {
+  factos.decider(
+    initial: Available,
+    decide: fn(state, command) {
+      case state, command {
+        Available, RegisterUser(username) -> {
+          let release = process.new_subject()
+          process.send(
+            messages,
+            DispatchReady(worker: worker, release: release),
+          )
+          let assert Ok(Nil) = process.receive(release, within: 10_000)
+          Ok([UserRegistered(username)])
+        }
+        Taken, RegisterUser(_) -> Error(AlreadyTaken)
+      }
+    },
+    evolve: evolve,
+  )
+}
+
+fn receive_dispatch_ready(
+  messages: process.Subject(DispatchMessage),
+) -> process.Subject(Nil) {
+  let assert Ok(message) = process.receive(messages, within: 10_000)
+  let assert DispatchReady(worker: _, release: release) = message
+  release
+}
+
+fn receive_dispatch_finished(
+  messages: process.Subject(DispatchMessage),
+) -> Result(factos_pog.Dispatch(Event), factos_pog.Error(DomainError)) {
+  let assert Ok(message) = process.receive(messages, within: 10_000)
+  case message {
+    DispatchFinished(worker: _, result:) -> result
+    DispatchReady(worker: _, release:) -> {
+      process.send(release, Nil)
+      receive_dispatch_finished(messages)
+    }
+  }
+}
+
+fn is_successful_dispatch(
+  result: Result(factos_pog.Dispatch(Event), factos_pog.Error(DomainError)),
+) -> Bool {
+  case result {
+    Ok(_) -> True
+    Error(_) -> False
+  }
+}
+
+fn is_stale_stream_dispatch(
+  result: Result(factos_pog.Dispatch(Event), factos_pog.Error(DomainError)),
+) -> Bool {
+  case result {
+    Error(factos_pog.AppendConditionFailed(factos.NoAppendCondition)) -> True
+    Error(factos_pog.DomainError(AlreadyTaken)) -> True
+    _ -> False
+  }
+}
+
+fn is_already_taken_dispatch(
+  result: Result(factos_pog.Dispatch(Event), factos_pog.Error(DomainError)),
+) -> Bool {
+  case result {
+    Error(factos_pog.DomainError(AlreadyTaken)) -> True
+    _ -> False
+  }
 }
 
 fn with_test_connection(
@@ -384,9 +590,6 @@ fn reset_schema(connection: pog.Connection) -> Nil {
   let assert Ok(_) =
     pog.query("drop table if exists factos_events")
     |> pog.execute(on: connection)
-  let assert Ok(_) =
-    pog.query("drop table if exists factos_locks")
-    |> pog.execute(on: connection)
   execute_migration_file(connection)
 }
 
@@ -405,26 +608,6 @@ fn execute_migration_file(connection: pog.Connection) -> Nil {
       }
     }
   })
-}
-
-fn factos_lock_keys(
-  connection: pog.Connection,
-) -> Result(List(String), pog.QueryError) {
-  pog.query(
-    "
-    select lock_key
-    from factos_locks
-    order by lock_key
-    ",
-  )
-  |> pog.returning(text_field_decoder())
-  |> pog.execute(on: connection)
-  |> result.map(fn(returned) { returned.rows })
-}
-
-fn text_field_decoder() -> dynamic_decode.Decoder(String) {
-  use value <- dynamic_decode.field(0, dynamic_decode.string)
-  dynamic_decode.success(value)
 }
 
 fn insert_unknown_event(connection: pog.Connection) -> Nil {
@@ -568,25 +751,25 @@ fn dispatch_counter_context_many(
 ) -> Result(factos_pog.Dispatch(CounterEvent), factos_pog.Error(Nil)) {
   case remaining {
     0 ->
-      factos_pog.dispatch_with_query(
-        connection,
+      factos_pog.new_dispatch_builder(
+        connection: connection,
         stream: "counter-context-0",
-        query: query,
         decider: counter_decider(),
         codec: counter_codec(),
-        command: Increment,
       )
+      |> factos_pog.with_query(query: query)
+      |> factos_pog.dispatch(Increment)
     _ -> {
       let stream_name = "counter-context-" <> int.to_string(remaining)
       let result =
-        factos_pog.dispatch_with_query(
-          connection,
+        factos_pog.new_dispatch_builder(
+          connection: connection,
           stream: stream_name,
-          query: query,
           decider: counter_decider(),
           codec: counter_codec(),
-          command: Increment,
         )
+        |> factos_pog.with_query(query: query)
+        |> factos_pog.dispatch(Increment)
       case remaining, result {
         1, _ -> result
         _, Ok(_) ->
