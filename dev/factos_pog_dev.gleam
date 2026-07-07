@@ -17,7 +17,7 @@ import testcontainer
 import testcontainer/error as testcontainer_error
 import testcontainer_formulas/postgres
 
-const workers = 40
+const workers = 8
 
 const operations_per_worker = 5
 
@@ -61,11 +61,11 @@ type BenchmarkInput {
 }
 
 type Command {
-  Increment
+  Increment(stream_name: String)
 }
 
 type Event {
-  Incremented(value: Int)
+  Incremented(stream_name: String, value: Int)
 }
 
 type State {
@@ -238,7 +238,7 @@ fn dispatch_once(
     codec: codec(),
   )
   |> factos_pog.with_retry_attempts(100)
-  |> factos_pog.dispatch(Increment)
+  |> factos_pog.dispatch(Increment(stream_name:))
 }
 
 fn decider() -> factos.Decider(Command, State, Event, Nil) {
@@ -248,14 +248,14 @@ fn decider() -> factos.Decider(Command, State, Event, Nil) {
 fn decide(state: State, command: Command) -> Result(List(Event), Nil) {
   let Counter(total) = state
   case command {
-    Increment -> Ok([Incremented(total + 1)])
+    Increment(stream_name:) -> Ok([Incremented(stream_name:, value: total + 1)])
   }
 }
 
 fn evolve(state: State, event: Event) -> State {
   let Counter(total) = state
   case event {
-    Incremented(_) -> Counter(total + 1)
+    Incremented(..) -> Counter(total + 1)
   }
 }
 
@@ -264,9 +264,9 @@ fn codec() -> factos_pog.EventCodec(Event) {
 }
 
 fn encode(event: Event) -> factos_pog.Proposed(Event) {
-  let Incremented(value) = event
+  let Incremented(stream_name:, value:) = event
   factos_pog.Proposed(
-    id: "event-" <> int.to_string(value),
+    id: benchmark_event_id(stream_name, value),
     event: event,
     type_: factos.event_type("Incremented"),
     version: 1,
@@ -274,6 +274,20 @@ fn encode(event: Event) -> factos_pog.Proposed(Event) {
     metadata: factos.empty_metadata(),
     data: bit_array.from_string(int.to_string(value)),
   )
+}
+
+fn benchmark_event_id(stream_name: String, value: Int) -> String {
+  let stream_number = case stream_name {
+    "sequential" -> 0
+    stream_name ->
+      stream_name
+      |> string.replace("concurrent-", "")
+      |> int.parse
+      |> result.unwrap(99)
+  }
+  "b3b12f1d-6d85-4f1f-9c2a-"
+  <> string.pad_start(int.to_string(stream_number), 2, "0")
+  <> string.pad_start(int.to_string(value), 10, "0")
 }
 
 fn decode(
@@ -288,7 +302,7 @@ fn decode(
     |> result.replace_error(factos_pog.InvalidData),
   )
   Ok(factos.Decoded(
-    event: Incremented(value),
+    event: Incremented(stream_name: stored.stream, value:),
     type_: stored.type_,
     version: stored.version,
     tags: stored.tags,

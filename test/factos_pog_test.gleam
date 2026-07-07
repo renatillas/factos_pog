@@ -57,6 +57,30 @@ pub type Timeout(a) {
   Timeout(time: Int, function: fn() -> a)
 }
 
+pub fn compatibility_migration_enforces_uuidv4_identity_contract_test_() -> Timeout(
+  Nil,
+) {
+  use <- Timeout(120)
+  let assert Ok(Nil) =
+    with_test_connection(fn(connection) {
+      reset_schema(connection)
+      assert_uuidv4_identity_contract(connection)
+    })
+  Nil
+}
+
+pub fn dbmate_migrations_enforce_uuidv4_identity_contract_test_() -> Timeout(
+  Nil,
+) {
+  use <- Timeout(120)
+  let assert Ok(Nil) =
+    with_test_connection(fn(connection) {
+      reset_schema_from_dbmate(connection)
+      assert_uuidv4_identity_contract(connection)
+    })
+  Nil
+}
+
 pub fn dispatch_builder_with_one_retry_attempt_persists_events_test_() -> Timeout(
   Nil,
 ) {
@@ -445,7 +469,7 @@ fn start_blocked_dispatch_worker(
         connection: connection,
         stream: stream_name,
         decider: blocking_decider(messages, worker: worker),
-        codec: codec(),
+        codec: worker_codec(worker),
       )
       |> factos_pog.dispatch(command)
     process.send(messages, DispatchFinished(worker: worker, result: result))
@@ -466,7 +490,7 @@ fn start_blocked_query_dispatch_worker(
         connection: connection,
         stream: stream_name,
         decider: blocking_decider(messages, worker: worker),
-        codec: codec(),
+        codec: worker_codec(worker),
       )
       |> factos_pog.with_query(query: query)
       |> factos_pog.dispatch(command)
@@ -581,6 +605,24 @@ fn start_test_connection(
 }
 
 fn reset_schema(connection: pog.Connection) -> Nil {
+  drop_schema(connection)
+  execute_migration_file(connection)
+}
+
+fn reset_schema_from_dbmate(connection: pog.Connection) -> Nil {
+  drop_schema(connection)
+  let assert Ok(priv_directory) = application.priv_directory("factos_pog")
+  execute_dbmate_up(
+    connection,
+    priv_directory <> "/dbmate/20260703000100_factos_pog_event_store.sql",
+  )
+  execute_dbmate_up(
+    connection,
+    priv_directory <> "/dbmate/20260704000100_factos_pog_outbox.sql",
+  )
+}
+
+fn drop_schema(connection: pog.Connection) -> Nil {
   let assert Ok(_) =
     pog.query("drop table if exists factos_outbox")
     |> pog.execute(on: connection)
@@ -590,13 +632,22 @@ fn reset_schema(connection: pog.Connection) -> Nil {
   let assert Ok(_) =
     pog.query("drop table if exists factos_events")
     |> pog.execute(on: connection)
-  execute_migration_file(connection)
+  Nil
 }
 
 fn execute_migration_file(connection: pog.Connection) -> Nil {
   let assert Ok(priv_directory) = application.priv_directory("factos_pog")
   let assert Ok(sql) = simplifile.read(priv_directory <> "/migrations.sql")
+  execute_sql(connection, sql)
+}
 
+fn execute_dbmate_up(connection: pog.Connection, path: String) -> Nil {
+  let assert Ok(sql) = simplifile.read(path)
+  let assert [up, ..] = string.split(sql, "-- migrate:down")
+  execute_sql(connection, up)
+}
+
+fn execute_sql(connection: pog.Connection, sql: String) -> Nil {
   sql
   |> string.split(";")
   |> list.each(fn(statement) {
@@ -608,6 +659,93 @@ fn execute_migration_file(connection: pog.Connection) -> Nil {
       }
     }
   })
+}
+
+fn assert_uuidv4_identity_contract(connection: pog.Connection) -> Nil {
+  let valid_id = "b3b12f1d-6d85-4f1f-9c2a-94766a34f011"
+  assert insert_event_succeeds(connection, valid_id, "valid-stream")
+
+  [
+    #("customer-registered", "semantic-stream"),
+    #("event-b3b12f1d-6d85-4f1f-9c2a-94766a34f012", "prefixed-stream"),
+    #("b3b12f1d-6d85-5f1f-9c2a-94766a34f013", "wrong-version-stream"),
+    #("not-a-uuid", "malformed-stream"),
+  ]
+  |> list.each(fn(case_) {
+    let #(invalid_id, stream_name) = case_
+    assert !insert_event_succeeds(connection, invalid_id, stream_name)
+  })
+
+  assert !insert_event_succeeds(connection, valid_id, "different-stream")
+  assert insert_outbox_succeeds(
+    connection,
+    source_event_id: valid_id,
+    effect_key: "valid-effect",
+  )
+
+  [
+    #("customer-registered", "semantic-effect"),
+    #("event-b3b12f1d-6d85-4f1f-9c2a-94766a34f012", "prefixed-effect"),
+    #("b3b12f1d-6d85-4f1f-7c2a-94766a34f013", "wrong-variant-effect"),
+    #("not-a-uuid", "malformed-effect"),
+  ]
+  |> list.each(fn(case_) {
+    let #(invalid_id, effect_key) = case_
+    assert !insert_outbox_succeeds(
+      connection,
+      source_event_id: invalid_id,
+      effect_key: effect_key,
+    )
+  })
+}
+
+fn insert_event_succeeds(
+  connection: pog.Connection,
+  id: String,
+  stream_name: String,
+) -> Bool {
+  case
+    pog.query(
+      "
+      insert into factos_events (id, stream, revision, type, version, tags, metadata, data)
+      values ($1, $2, 0, 'ContractChecked', 1, '', '', '\\x00')
+      ",
+    )
+    |> pog.parameter(pog.text(id))
+    |> pog.parameter(pog.text(stream_name))
+    |> pog.execute(on: connection)
+  {
+    Ok(_) -> True
+    Error(_) -> False
+  }
+}
+
+fn insert_outbox_succeeds(
+  connection: pog.Connection,
+  source_event_id source_event_id: String,
+  effect_key effect_key: String,
+) -> Bool {
+  case
+    pog.query(
+      "
+      insert into factos_outbox (
+        source_position, source_event_id, source_context, consumer,
+        effect_key, target, type, metadata, payload
+      )
+      values (
+        (select position from factos_events where id = $1),
+        $2, 'valid-stream', 'contract-test', $3, 'sink', 'Effect', '', '\\x00'
+      )
+      ",
+    )
+    |> pog.parameter(pog.text("b3b12f1d-6d85-4f1f-9c2a-94766a34f011"))
+    |> pog.parameter(pog.text(source_event_id))
+    |> pog.parameter(pog.text(effect_key))
+    |> pog.execute(on: connection)
+  {
+    Ok(_) -> True
+    Error(_) -> False
+  }
 }
 
 fn insert_unknown_event(connection: pog.Connection) -> Nil {
@@ -624,7 +762,7 @@ fn insert_unknown_event(connection: pog.Connection) -> Nil {
       select position, $9 from inserted
       ",
     )
-    |> pog.parameter(pog.text("event-unknown"))
+    |> pog.parameter(pog.text("b3b12f1d-6d85-4f1f-9c2a-94766a34f004"))
     |> pog.parameter(pog.text("unknown-stream"))
     |> pog.parameter(pog.int(0))
     |> pog.parameter(pog.text("UnknownEventType"))
@@ -652,7 +790,7 @@ fn assert_user_recorded(
   position position: factos.SequencePosition,
   username username: String,
 ) -> Nil {
-  assert recorded.id == "event-" <> username
+  assert recorded.id == user_event_id(username)
   assert recorded.stream == stream_name
   assert recorded.revision == revision
   assert recorded.position == position
@@ -683,8 +821,19 @@ fn codec() -> factos_pog.EventCodec(Event) {
 }
 
 fn encode(event: Event) -> factos_pog.Proposed(Event) {
+  proposed_event(event, user_event_id(event.username))
+}
+
+fn worker_codec(worker: String) -> factos_pog.EventCodec(Event) {
+  factos_pog.codec(
+    encode: fn(event) { proposed_event(event, worker_event_id(worker)) },
+    decode: decode,
+  )
+}
+
+fn proposed_event(event: Event, id: String) -> factos_pog.Proposed(Event) {
   factos_pog.Proposed(
-    id: "event-" <> event.username,
+    id: id,
     event: event,
     type_: factos.event_type("UserRegistered"),
     version: 1,
@@ -692,6 +841,21 @@ fn encode(event: Event) -> factos_pog.Proposed(Event) {
     metadata: factos.empty_metadata(),
     data: bit_array.from_string(event.username),
   )
+}
+
+fn worker_event_id(worker: String) -> String {
+  case worker {
+    "first" -> "b3b12f1d-6d85-4f1f-9c2a-94766a34f005"
+    _ -> "b3b12f1d-6d85-4f1f-9c2a-94766a34f006"
+  }
+}
+
+fn user_event_id(username: String) -> String {
+  case username {
+    "renata" -> "b3b12f1d-6d85-4f1f-9c2a-94766a34f001"
+    "lucy" -> "b3b12f1d-6d85-4f1f-9c2a-94766a34f002"
+    _ -> "b3b12f1d-6d85-4f1f-9c2a-94766a34f003"
+  }
 }
 
 fn decode(
@@ -820,7 +984,7 @@ fn encode_counter_event(
   case event {
     Incremented(value) ->
       factos_pog.Proposed(
-        id: "counter-event-" <> int.to_string(value),
+        id: counter_event_id(value),
         event: event,
         type_: factos.event_type("Incremented"),
         version: 1,
@@ -829,6 +993,10 @@ fn encode_counter_event(
         data: bit_array.from_string(int.to_string(value)),
       )
   }
+}
+
+fn counter_event_id(value: Int) -> String {
+  "b3b12f1d-6d85-4f1f-9c2a-" <> string.pad_start(int.to_string(value), 12, "0")
 }
 
 fn decode_counter_event(
@@ -864,7 +1032,7 @@ fn assert_counter_recorded(
   value value: Int,
   type_ type_: factos.EventType,
 ) -> Nil {
-  assert recorded.id == "counter-event-" <> int.to_string(value)
+  assert recorded.id == counter_event_id(value)
   assert recorded.stream == stream_name
   assert recorded.revision == revision
   assert recorded.position == position

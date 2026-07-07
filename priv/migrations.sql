@@ -1,6 +1,8 @@
 create table if not exists factos_events (
   position bigint generated always as identity primary key,
-  id text not null,
+  id text not null unique check (
+    id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+  ),
   stream text not null,
   revision integer not null,
   type text not null,
@@ -39,7 +41,9 @@ on conflict do nothing;
 create table if not exists factos_outbox (
   id bigint generated always as identity primary key,
   source_position bigint not null references factos_events(position),
-  source_event_id text not null,
+  source_event_id text not null check (
+    source_event_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+  ),
   source_context text not null,
   consumer text not null,
   effect_key text not null,
