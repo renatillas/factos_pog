@@ -51,14 +51,44 @@ create table if not exists factos_outbox (
   type text not null,
   metadata text not null,
   payload bytea not null,
-  status text not null default 'pending',
-  attempts integer not null default 0,
+  status text not null default 'pending'
+    check (status in ('pending', 'delivered', 'dead_lettered')),
+  attempts integer not null default 0 check (attempts >= 0),
   available_at timestamptz not null default now(),
   locked_until timestamptz,
+  lock_token text,
   last_error text,
   created_at timestamptz not null default now(),
   delivered_at timestamptz,
-  unique(consumer, effect_key)
+  failed_at timestamptz,
+  unique(consumer, effect_key),
+  constraint factos_outbox_lock_check
+    check (
+      (locked_until is null) = (lock_token is null)
+      and (lock_token is null or btrim(lock_token) <> '')
+    ),
+  constraint factos_outbox_lifecycle_check
+    check (
+      (status = 'pending'
+        and delivered_at is null
+        and failed_at is null)
+      or
+      (status = 'delivered'
+        and delivered_at is not null
+        and delivered_at >= created_at
+        and failed_at is null
+        and locked_until is null
+        and lock_token is null)
+      or
+      (status = 'dead_lettered'
+        and delivered_at is null
+        and failed_at is not null
+        and failed_at >= created_at
+        and last_error is not null
+        and btrim(last_error) <> ''
+        and locked_until is null
+        and lock_token is null)
+    )
 );
 
 create index if not exists factos_outbox_lease_pending

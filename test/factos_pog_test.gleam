@@ -1,6 +1,7 @@
 import factos
 import factos/factos_pog
 import gleam/bit_array
+import gleam/dynamic/decode
 import gleam/erlang/application
 import gleam/erlang/process
 import gleam/int
@@ -39,6 +40,24 @@ type State {
 
 type DomainError {
   AlreadyTaken
+}
+
+type OutboxRowState {
+  OutboxRowState(
+    status: String,
+    attempts: Int,
+    lock_token: String,
+    locked_until: String,
+    available_at: String,
+    available: Bool,
+    last_error: String,
+    delivered_at: String,
+    failed_at: String,
+    delivered_timestamp_valid: Bool,
+    failed_timestamp_valid: Bool,
+    delivered_timestamp_absent: Bool,
+    failed_timestamp_absent: Bool,
+  )
 }
 
 type CounterCommand {
@@ -389,7 +408,7 @@ pub fn read_events_after_returns_global_position_slice_test_() -> Timeout(Nil) {
   Nil
 }
 
-pub fn dispatch_builder_with_reactor_persists_and_leases_outbox_test_() -> Timeout(
+pub fn outbox_lease_returns_persisted_token_and_ack_is_single_use_test_() -> Timeout(
   Nil,
 ) {
   use <- Timeout(120)
@@ -397,32 +416,10 @@ pub fn dispatch_builder_with_reactor_persists_and_leases_outbox_test_() -> Timeo
     with_test_connection(fn(connection) {
       reset_schema(connection)
 
-      let assert Ok(dispatch) =
-        factos_pog.new_dispatch(
-          connection: connection,
-          stream: "user-renata",
-          decider: decider(),
-          codec: codec(),
-        )
-        |> factos_pog.with_query(query: username_query("renata"))
-        |> factos_pog.with_reactor(
-          reactor: welcome_reactor(),
-          codec: effect_codec(),
-        )
-        |> factos_pog.dispatch(RegisterUser("renata"))
-
+      let #(dispatch, message) = dispatch_welcome_and_lease(connection)
       let assert factos.SequencePosition(source_position) =
         dispatch.append.position
-      let assert Ok(messages) =
-        factos_pog.lease_outbox(
-          connection,
-          consumer: "wallets",
-          target: "ledgers",
-          limit: 10,
-          lease_for_milliseconds: 30_000,
-        )
 
-      let assert [message] = messages
       assert message.source_position == factos.SequencePosition(source_position)
       assert message.source_context == "user-renata"
       assert message.consumer == "wallets"
@@ -432,19 +429,319 @@ pub fn dispatch_builder_with_reactor_persists_and_leases_outbox_test_() -> Timeo
       assert factos.metadata_get(message.metadata, factos.correlation_id)
         == Ok("corr-renata")
       assert bit_array.to_string(message.payload) == Ok("renata")
+      assert message.lock_token != ""
 
-      let assert Ok(Nil) = factos_pog.ack_outbox(connection, id: message.id)
-      let assert Ok(messages_after_ack) =
-        factos_pog.lease_outbox(
+      let leased = read_outbox_state(connection, message.id)
+      assert leased.status == "pending"
+      assert leased.attempts == 1
+      assert leased.lock_token == message.lock_token
+      assert leased.locked_until != ""
+      assert leased.delivered_timestamp_absent
+      assert leased.failed_timestamp_absent
+
+      let assert Ok(factos_pog.Finalized) =
+        factos_pog.ack_outbox(
           connection,
-          consumer: "wallets",
-          target: "ledgers",
-          limit: 10,
-          lease_for_milliseconds: 30_000,
+          id: message.id,
+          lock_token: message.lock_token,
         )
-      assert messages_after_ack == []
+
+      let delivered = read_outbox_state(connection, message.id)
+      assert delivered.status == "delivered"
+      assert delivered.attempts == 1
+      assert delivered.lock_token == ""
+      assert delivered.locked_until == ""
+      assert delivered.delivered_timestamp_valid
+      assert delivered.failed_timestamp_absent
+
+      let assert Ok(factos_pog.StaleLease) =
+        factos_pog.ack_outbox(
+          connection,
+          id: message.id,
+          lock_token: message.lock_token,
+        )
+      assert read_outbox_state(connection, message.id) == delivered
+
+      let assert Ok([]) = lease_outbox(connection)
       Nil
     })
+  Nil
+}
+
+pub fn outbox_nack_releases_matching_lease_for_delayed_retry_test_() -> Timeout(
+  Nil,
+) {
+  use <- Timeout(120)
+  let assert Ok(Nil) =
+    with_test_connection(fn(connection) {
+      reset_schema(connection)
+      let #(_, first_lease) = dispatch_welcome_and_lease(connection)
+
+      let assert Ok(factos_pog.Finalized) =
+        factos_pog.nack_outbox(
+          connection,
+          id: first_lease.id,
+          lock_token: first_lease.lock_token,
+          error: "ledger temporarily unavailable",
+          retry_after_milliseconds: 60_000,
+        )
+
+      let released = read_outbox_state(connection, first_lease.id)
+      assert released.status == "pending"
+      assert released.attempts == 1
+      assert released.lock_token == ""
+      assert released.locked_until == ""
+      assert !released.available
+      assert released.last_error == "ledger temporarily unavailable"
+      assert released.delivered_timestamp_absent
+      assert released.failed_timestamp_absent
+      let assert Ok([]) = lease_outbox(connection)
+
+      make_outbox_available(connection, first_lease.id)
+      let assert Ok([second_lease]) = lease_outbox(connection)
+      assert second_lease.id == first_lease.id
+      assert second_lease.lock_token != first_lease.lock_token
+
+      let retried = read_outbox_state(connection, second_lease.id)
+      assert retried.status == "pending"
+      assert retried.attempts == 2
+      assert retried.lock_token == second_lease.lock_token
+      assert retried.locked_until != ""
+      assert retried.delivered_timestamp_absent
+      assert retried.failed_timestamp_absent
+      Nil
+    })
+  Nil
+}
+
+pub fn outbox_wrong_and_expired_tokens_cannot_finalize_current_lease_test_() -> Timeout(
+  Nil,
+) {
+  use <- Timeout(120)
+  let assert Ok(Nil) =
+    with_test_connection(fn(connection) {
+      reset_schema(connection)
+      let #(_, first_lease) = dispatch_welcome_and_lease(connection)
+      let wrong_token = "00000000-0000-4000-8000-000000000000"
+      let leased = read_outbox_state(connection, first_lease.id)
+
+      assert_all_finalizers_report_stale(
+        connection,
+        first_lease.id,
+        wrong_token,
+      )
+      assert read_outbox_state(connection, first_lease.id) == leased
+
+      expire_outbox_lease(connection, first_lease.id)
+      let expired = read_outbox_state(connection, first_lease.id)
+      let assert Ok(factos_pog.StaleLease) =
+        factos_pog.ack_outbox(
+          connection,
+          id: first_lease.id,
+          lock_token: first_lease.lock_token,
+        )
+      assert read_outbox_state(connection, first_lease.id) == expired
+
+      let assert Ok([second_lease]) = lease_outbox(connection)
+      assert second_lease.id == first_lease.id
+      assert second_lease.lock_token != first_lease.lock_token
+
+      let reacquired = read_outbox_state(connection, second_lease.id)
+      assert reacquired.status == "pending"
+      assert reacquired.attempts == 2
+      assert reacquired.lock_token == second_lease.lock_token
+      assert reacquired.locked_until != ""
+      assert reacquired.delivered_timestamp_absent
+      assert reacquired.failed_timestamp_absent
+
+      assert_all_finalizers_report_stale(
+        connection,
+        second_lease.id,
+        first_lease.lock_token,
+      )
+      assert read_outbox_state(connection, second_lease.id) == reacquired
+
+      let assert Ok(factos_pog.Finalized) =
+        factos_pog.ack_outbox(
+          connection,
+          id: second_lease.id,
+          lock_token: second_lease.lock_token,
+        )
+      Nil
+    })
+  Nil
+}
+
+pub fn outbox_fail_dead_letters_matching_lease_and_is_terminal_test_() -> Timeout(
+  Nil,
+) {
+  use <- Timeout(120)
+  let assert Ok(Nil) =
+    with_test_connection(fn(connection) {
+      reset_schema(connection)
+      let #(_, message) = dispatch_welcome_and_lease(connection)
+
+      let assert Ok(factos_pog.Finalized) =
+        factos_pog.fail_outbox(
+          connection,
+          id: message.id,
+          lock_token: message.lock_token,
+          error: "permanent ledger rejection",
+        )
+
+      let dead_lettered = read_outbox_state(connection, message.id)
+      assert dead_lettered.status == "dead_lettered"
+      assert dead_lettered.attempts == 1
+      assert dead_lettered.lock_token == ""
+      assert dead_lettered.locked_until == ""
+      assert dead_lettered.last_error == "permanent ledger rejection"
+      assert dead_lettered.failed_timestamp_valid
+      assert dead_lettered.delivered_timestamp_absent
+
+      assert_all_finalizers_report_stale(
+        connection,
+        message.id,
+        message.lock_token,
+      )
+      assert read_outbox_state(connection, message.id) == dead_lettered
+      let assert Ok([]) = lease_outbox(connection)
+      Nil
+    })
+  Nil
+}
+
+fn dispatch_welcome_and_lease(
+  connection: pog.Connection,
+) -> #(factos_pog.Dispatch(Event), factos_pog.OutboxMessage) {
+  let assert Ok(dispatch) =
+    factos_pog.new_dispatch(
+      connection: connection,
+      stream: "user-renata",
+      decider: decider(),
+      codec: codec(),
+    )
+    |> factos_pog.with_query(query: username_query("renata"))
+    |> factos_pog.with_reactor(
+      reactor: welcome_reactor(),
+      codec: effect_codec(),
+    )
+    |> factos_pog.dispatch(RegisterUser("renata"))
+  let assert Ok([message]) = lease_outbox(connection)
+  #(dispatch, message)
+}
+
+fn lease_outbox(
+  connection: pog.Connection,
+) -> Result(List(factos_pog.OutboxMessage), factos_pog.Error(Nil)) {
+  factos_pog.lease_outbox(
+    connection,
+    consumer: "wallets",
+    target: "ledgers",
+    limit: 10,
+    lease_for_milliseconds: 30_000,
+  )
+}
+
+fn assert_all_finalizers_report_stale(
+  connection: pog.Connection,
+  id: Int,
+  lock_token: String,
+) -> Nil {
+  let assert Ok(factos_pog.StaleLease) =
+    factos_pog.ack_outbox(connection, id: id, lock_token: lock_token)
+  let assert Ok(factos_pog.StaleLease) =
+    factos_pog.nack_outbox(
+      connection,
+      id: id,
+      lock_token: lock_token,
+      error: "must not replace the current error",
+      retry_after_milliseconds: 60_000,
+    )
+  let assert Ok(factos_pog.StaleLease) =
+    factos_pog.fail_outbox(
+      connection,
+      id: id,
+      lock_token: lock_token,
+      error: "must not dead-letter",
+    )
+  Nil
+}
+
+fn read_outbox_state(connection: pog.Connection, id: Int) -> OutboxRowState {
+  let assert Ok(returned) =
+    pog.query(
+      "
+      select
+        status,
+        attempts,
+        coalesce(lock_token, ''),
+        coalesce(locked_until::text, ''),
+        available_at::text,
+        available_at <= now(),
+        coalesce(last_error, ''),
+        coalesce(delivered_at::text, ''),
+        coalesce(failed_at::text, ''),
+        coalesce(delivered_at >= created_at, false),
+        coalesce(failed_at >= created_at, false),
+        delivered_at is null,
+        failed_at is null
+      from factos_outbox
+      where id = $1
+      ",
+    )
+    |> pog.parameter(pog.int(id))
+    |> pog.returning(outbox_row_state_decoder())
+    |> pog.execute(on: connection)
+  let assert [state] = returned.rows
+  state
+}
+
+fn outbox_row_state_decoder() -> decode.Decoder(OutboxRowState) {
+  use status <- decode.field(0, decode.string)
+  use attempts <- decode.field(1, decode.int)
+  use lock_token <- decode.field(2, decode.string)
+  use locked_until <- decode.field(3, decode.string)
+  use available_at <- decode.field(4, decode.string)
+  use available <- decode.field(5, decode.bool)
+  use last_error <- decode.field(6, decode.string)
+  use delivered_at <- decode.field(7, decode.string)
+  use failed_at <- decode.field(8, decode.string)
+  use delivered_timestamp_valid <- decode.field(9, decode.bool)
+  use failed_timestamp_valid <- decode.field(10, decode.bool)
+  use delivered_timestamp_absent <- decode.field(11, decode.bool)
+  use failed_timestamp_absent <- decode.field(12, decode.bool)
+  decode.success(OutboxRowState(
+    status: status,
+    attempts: attempts,
+    lock_token: lock_token,
+    locked_until: locked_until,
+    available_at: available_at,
+    available: available,
+    last_error: last_error,
+    delivered_at: delivered_at,
+    failed_at: failed_at,
+    delivered_timestamp_valid: delivered_timestamp_valid,
+    failed_timestamp_valid: failed_timestamp_valid,
+    delivered_timestamp_absent: delivered_timestamp_absent,
+    failed_timestamp_absent: failed_timestamp_absent,
+  ))
+}
+
+fn expire_outbox_lease(connection: pog.Connection, id: Int) -> Nil {
+  let assert Ok(_) =
+    pog.query(
+      "update factos_outbox set locked_until = now() - interval '1 second' where id = $1",
+    )
+    |> pog.parameter(pog.int(id))
+    |> pog.execute(on: connection)
+  Nil
+}
+
+fn make_outbox_available(connection: pog.Connection, id: Int) -> Nil {
+  let assert Ok(_) =
+    pog.query("update factos_outbox set available_at = now() where id = $1")
+    |> pog.parameter(pog.int(id))
+    |> pog.execute(on: connection)
   Nil
 }
 
@@ -619,6 +916,11 @@ fn reset_schema_from_dbmate(connection: pog.Connection) -> Nil {
   execute_dbmate_up(
     connection,
     priv_directory <> "/dbmate/20260704000100_factos_pog_outbox.sql",
+  )
+  execute_dbmate_up(
+    connection,
+    priv_directory
+      <> "/dbmate/20260714000100_factos_pog_outbox_delivery_safety.sql",
   )
 }
 

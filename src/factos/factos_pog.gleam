@@ -336,7 +336,17 @@ pub type OutboxMessage {
     type_: String,
     metadata: factos.Metadata,
     payload: BitArray,
+    /// Unguessable identity of this specific lease acquisition.
+    lock_token: String,
   )
+}
+
+/// Outcome of a guarded outbox finalization attempt.
+pub type OutboxFinalization {
+  /// The caller held the current, unexpired lease and changed the row.
+  Finalized
+  /// The row is no longer pending under the supplied current lease token.
+  StaleLease
 }
 
 pub type Error(domain_error) {
@@ -487,7 +497,7 @@ fn dispatch_query(
   )
   let #(context, events) = pair
 
-  append_with_condition(
+  append_context_events(
     transaction_connection,
     stream_name,
     events,
@@ -522,7 +532,7 @@ fn dispatch_query_with_reactor(
     |> result.map_error(DomainError),
   )
   let #(context, events) = pair
-  use dispatch <- result.try(append_with_condition(
+  use dispatch <- result.try(append_context_events(
     transaction_connection,
     stream_name,
     events,
@@ -595,6 +605,7 @@ fn dispatch_stream(
     events,
     codec,
     loaded.revision,
+    factos.NoAppendCondition,
   )
 }
 
@@ -629,6 +640,7 @@ fn dispatch_stream_with_reactor(
     events,
     event_codec,
     loaded.revision,
+    factos.NoAppendCondition,
   ))
   use _ <- result.try(insert_outbox_effects(
     transaction_connection,
@@ -708,31 +720,12 @@ fn retryable_transaction_error(error: Error(_)) -> Bool {
   }
 }
 
-fn append_with_condition(
+fn append_context_events(
   connection: pog.Connection,
   stream_name: String,
   events: List(event),
   codec: EventCodec(event),
   condition: factos.AppendCondition,
-) -> Result(Dispatch(event), Error(domain_error)) {
-  case condition {
-    factos.NoAppendCondition ->
-      append_current_stream(connection, stream_name, events, codec)
-    factos.FailIfEventsMatch(query, after) ->
-      case has_matching_events_after(connection, query, after) {
-        Error(error) -> Error(StoreError(error))
-        Ok(True) -> Error(AppendConditionFailed(condition))
-        Ok(False) ->
-          append_current_stream(connection, stream_name, events, codec)
-      }
-  }
-}
-
-fn append_current_stream(
-  connection: pog.Connection,
-  stream_name: String,
-  events: List(event),
-  codec: EventCodec(event),
 ) -> Result(Dispatch(event), Error(domain_error)) {
   use revision <- result.try(
     current_revision(connection, stream_name)
@@ -744,6 +737,7 @@ fn append_current_stream(
     events,
     codec,
     factos.CurrentRevision(revision),
+    condition,
   )
 }
 
@@ -753,6 +747,7 @@ fn append_stream_events(
   events: List(event),
   codec: EventCodec(event),
   expected: factos.Revision,
+  condition: factos.AppendCondition,
 ) -> Result(Dispatch(event), Error(domain_error)) {
   case events {
     [] -> {
@@ -764,23 +759,17 @@ fn append_stream_events(
       Ok(Dispatch(append:, events: []))
     }
     [_, ..] -> {
-      use current <- result.try(
-        current_revision(connection, stream_name)
-        |> result.map_error(StoreError),
+      insert_events(
+        connection,
+        stream_name,
+        events,
+        codec,
+        revision_to_int(expected) + 1,
+        expected,
+        condition,
+        factos.NoPosition,
+        [],
       )
-      case expected_matches(expected, current) {
-        False -> Error(AppendConditionFailed(factos.NoAppendCondition))
-        True ->
-          insert_events(
-            connection,
-            stream_name,
-            events,
-            codec,
-            current + 1,
-            factos.NoPosition,
-            [],
-          )
-      }
     }
   }
 }
@@ -799,6 +788,8 @@ fn insert_events(
   events: List(event),
   codec: EventCodec(event),
   revision: Int,
+  expected: factos.Revision,
+  condition: factos.AppendCondition,
   position: factos.SequencePosition,
   recorded_events: List(factos.Recorded(event)),
 ) -> Result(Dispatch(event), Error(domain_error)) {
@@ -808,43 +799,33 @@ fn insert_events(
       Ok(Dispatch(append:, events: list.reverse(recorded_events)))
     }
     [event, ..rest] -> {
-      let EventCodec(encode, _) = codec
+      let EventCodec(encode:, ..) = codec
       let Proposed(id, _, type_, version, tags, metadata, data) = encode(event)
-      use returned <- result.try(
-        pog.query(
-          "
-          insert into factos_events (id, stream, revision, type, version, tags, metadata, data)
-          values ($1, $2, $3, $4, $5, $6, $7, $8)
-          returning position
-          ",
-        )
-        |> pog.parameter(pog.text(id))
-        |> pog.parameter(pog.text(stream_name))
-        |> pog.parameter(pog.int(revision))
-        |> pog.parameter(pog.text(factos.event_type_name(type_)))
-        |> pog.parameter(pog.int(version))
-        |> pog.parameter(pog.text(tags_to_text(tags)))
-        |> pog.parameter(pog.text(metadata_to_text(metadata)))
-        |> pog.parameter(pog.bytea(data))
-        |> pog.returning(int_field_decoder())
-        |> pog.execute(on: connection)
-        |> result.map_error(map_event_insert_error),
-      )
-      let position = case returned.rows {
-        [position, ..] -> factos.SequencePosition(position)
-        [] -> position
-      }
+      use returned_position <- result.try(insert_event_if_revision_matches(
+        connection,
+        stream_name,
+        revision:,
+        expected:,
+        condition:,
+        id:,
+        type_:,
+        version:,
+        tags:,
+        metadata:,
+        data:,
+      ))
+      let position = factos.SequencePosition(returned_position)
       let recorded =
         factos.Recorded(
           id: id,
           stream: stream_name,
-          revision: revision,
-          position: position,
-          type_: type_,
-          version: version,
-          tags: tags,
-          metadata: metadata,
-          event: event,
+          revision:,
+          position:,
+          type_:,
+          version:,
+          tags:,
+          metadata:,
+          event:,
         )
       use _ <- result.try(insert_event_tags(connection, position, tags))
       insert_events(
@@ -853,9 +834,74 @@ fn insert_events(
         rest,
         codec,
         revision + 1,
+        factos.CurrentRevision(revision),
+        factos.NoAppendCondition,
         position,
         [recorded, ..recorded_events],
       )
+    }
+  }
+}
+
+fn insert_event_if_revision_matches(
+  connection: pog.Connection,
+  stream_name: String,
+  revision revision: Int,
+  expected expected: factos.Revision,
+  condition condition: factos.AppendCondition,
+  id id: String,
+  type_ type_: factos.EventType,
+  version version: Int,
+  tags tags: List(factos.Tag),
+  metadata metadata: factos.Metadata,
+  data data: BitArray,
+) -> Result(Int, Error(domain_error)) {
+  let QuerySql(condition_sql, condition_parameters) =
+    append_condition_to_having_sql(condition)
+  use returned <- result.try(
+    pog.query("
+      insert into factos_events (id, stream, revision, type, version, tags, metadata, data)
+      select $1, $2, $3, $4, $5, $6, $7, $8
+      from factos_events
+      where stream = $2
+      having coalesce(max(revision), -1) = $9
+      " <> condition_sql <> "
+      returning position
+      ")
+    |> pog.parameter(pog.text(id))
+    |> pog.parameter(pog.text(stream_name))
+    |> pog.parameter(pog.int(revision))
+    |> pog.parameter(pog.text(factos.event_type_name(type_)))
+    |> pog.parameter(pog.int(version))
+    |> pog.parameter(pog.text(tags_to_text(tags)))
+    |> pog.parameter(pog.text(metadata_to_text(metadata)))
+    |> pog.parameter(pog.bytea(data))
+    |> pog.parameter(pog.int(revision_to_int(expected)))
+    |> with_parameters(condition_parameters)
+    |> pog.returning(int_field_decoder())
+    |> pog.execute(on: connection)
+    |> result.map_error(map_event_insert_error),
+  )
+
+  case returned.rows {
+    [position, ..] -> Ok(position)
+    [] -> Error(AppendConditionFailed(condition))
+  }
+}
+
+fn append_condition_to_having_sql(
+  condition: factos.AppendCondition,
+) -> QuerySql {
+  case condition {
+    factos.NoAppendCondition -> QuerySql(sql: "", parameters: [])
+    factos.FailIfEventsMatch(query, after) -> {
+      let QuerySql(where_sql, parameters) =
+        matching_events_after_sql_from(query, after, parameter_index: 10)
+      QuerySql(sql: " and not exists (
+          select 1
+          from factos_events
+          " <> where_sql <> "
+        )", parameters: parameters)
     }
   }
 }
@@ -1065,30 +1111,6 @@ fn current_revision(
   }
 }
 
-// This is a validation query, not a lock. PostgreSQL `SERIALIZABLE` isolation
-// detects concurrent predicate changes and returns a retryable serialization
-// failure when another committed transaction invalidates this command's context.
-fn has_matching_events_after(
-  connection: pog.Connection,
-  query: factos.Query,
-  after: factos.SequencePosition,
-) -> Result(Bool, pog.QueryError) {
-  let QuerySql(where_sql, parameters) = matching_events_after_sql(query, after)
-  pog.query("select 1
-     from factos_events
-     " <> where_sql <> "
-     limit 1")
-  |> with_parameters(parameters)
-  |> pog.returning(int_field_decoder())
-  |> pog.execute(on: connection)
-  |> result.map(fn(returned) {
-    case returned.rows {
-      [] -> False
-      [_, ..] -> True
-    }
-  })
-}
-
 fn int_field_decoder() -> decode.Decoder(Int) {
   use value <- decode.field(0, decode.int)
   decode.success(value)
@@ -1107,13 +1129,6 @@ fn highest_recorded_position(
   case list.reverse(events) {
     [] -> factos.NoPosition
     [event, ..] -> event.position
-  }
-}
-
-fn expected_matches(expected: factos.Revision, current: Int) -> Bool {
-  case expected {
-    factos.NoEvents -> current == -1
-    factos.CurrentRevision(revision) -> current == revision
   }
 }
 
@@ -1177,14 +1192,23 @@ fn matching_events_after_sql(
   query: factos.Query,
   after: factos.SequencePosition,
 ) -> QuerySql {
+  matching_events_after_sql_from(query, after, parameter_index: 1)
+}
+
+fn matching_events_after_sql_from(
+  query: factos.Query,
+  after: factos.SequencePosition,
+  parameter_index parameter_index: Int,
+) -> QuerySql {
   let after_position = case after {
     factos.NoPosition -> -1
     factos.SequencePosition(position) -> position
   }
+  let after_placeholder = "$" <> int.to_string(parameter_index)
 
   case query {
     factos.AllEvents ->
-      QuerySql(sql: "where position > $1", parameters: [
+      QuerySql(sql: "where position > " <> after_placeholder, parameters: [
         IntParameter(after_position),
       ])
     factos.Query(items) -> {
@@ -1192,9 +1216,13 @@ fn matching_events_after_sql(
         [] -> QuerySql(sql: "where 1 = 0", parameters: [])
         [_, ..] -> {
           let #(sql, parameters, _) =
-            build_query_items_sql(items, 2, [], [IntParameter(after_position)])
+            build_query_items_sql(items, parameter_index + 1, [], [
+              IntParameter(after_position),
+            ])
           QuerySql(
-            sql: "where position > $1 and ("
+            sql: "where position > "
+              <> after_placeholder
+              <> " and ("
               <> string.join(list.reverse(sql), with: " or ")
               <> ")",
             parameters: list.reverse(parameters),
@@ -1332,6 +1360,7 @@ pub fn lease_outbox(
         update factos_outbox
         set
           locked_until = now() + ($4::integer * interval '1 millisecond'),
+          lock_token = gen_random_uuid()::text,
           attempts = attempts + 1
         where id in (
           select id
@@ -1341,7 +1370,7 @@ pub fn lease_outbox(
             and status = 'pending'
             and available_at <= now()
             and (locked_until is null or locked_until <= now())
-          order by id
+          order by available_at, id
           limit $3
           for update skip locked
         )
@@ -1355,7 +1384,8 @@ pub fn lease_outbox(
           target,
           type,
           metadata,
-          payload
+          payload,
+          lock_token
         ",
       )
       |> pog.parameter(pog.text(consumer))
@@ -1369,47 +1399,111 @@ pub fn lease_outbox(
   }
 }
 
-/// Mark an outbox message as delivered.
+/// Mark an outbox message as delivered if the caller still owns its lease.
 pub fn ack_outbox(
   connection: pog.Connection,
   id id: Int,
-) -> Result(Nil, Error(_)) {
+  lock_token lock_token: String,
+) -> Result(OutboxFinalization, Error(_)) {
   pog.query(
     "
     update factos_outbox
     set status = 'delivered',
         delivered_at = now(),
-        locked_until = null
+        locked_until = null,
+        lock_token = null
     where id = $1
+      and lock_token = $2
+      and status = 'pending'
+      and locked_until > now()
+    returning id
     ",
   )
   |> pog.parameter(pog.int(id))
+  |> pog.parameter(pog.text(lock_token))
+  |> pog.returning(int_field_decoder())
   |> pog.execute(on: connection)
-  |> result.map(nil_constant)
+  |> result.map(fn(returned) {
+    case returned.rows {
+      [_, ..] -> Finalized
+      [] -> StaleLease
+    }
+  })
   |> result.map_error(StoreError)
 }
 
-/// Release an outbox message for retry after a delay.
+/// Release an outbox message for retry if the caller still owns its lease.
 pub fn nack_outbox(
   connection: pog.Connection,
   id id: Int,
+  lock_token lock_token: String,
   error error: String,
   retry_after_milliseconds retry_after_milliseconds: Int,
-) -> Result(Nil, Error(_)) {
+) -> Result(OutboxFinalization, Error(_)) {
   pog.query(
     "
     update factos_outbox
     set locked_until = null,
-        last_error = $2,
-        available_at = now() + ($3::integer * interval '1 millisecond')
+        lock_token = null,
+        last_error = $3,
+        available_at = now() + ($4::integer * interval '1 millisecond')
     where id = $1
+      and lock_token = $2
+      and status = 'pending'
+      and locked_until > now()
+    returning id
     ",
   )
   |> pog.parameter(pog.int(id))
+  |> pog.parameter(pog.text(lock_token))
   |> pog.parameter(pog.text(error))
   |> pog.parameter(pog.int(retry_after_milliseconds))
+  |> pog.returning(int_field_decoder())
   |> pog.execute(on: connection)
-  |> result.map(nil_constant)
+  |> result.map(fn(returned) {
+    case returned.rows {
+      [_, ..] -> Finalized
+      [] -> StaleLease
+    }
+  })
+  |> result.map_error(StoreError)
+}
+
+/// Permanently dead-letter a poison message if the caller owns its lease.
+///
+/// `error` is required and the database rejects empty or whitespace-only values.
+pub fn fail_outbox(
+  connection: pog.Connection,
+  id id: Int,
+  lock_token lock_token: String,
+  error error: String,
+) -> Result(OutboxFinalization, Error(_)) {
+  pog.query(
+    "
+    update factos_outbox
+    set status = 'dead_lettered',
+        failed_at = now(),
+        last_error = $3,
+        locked_until = null,
+        lock_token = null
+    where id = $1
+      and lock_token = $2
+      and status = 'pending'
+      and locked_until > now()
+    returning id
+    ",
+  )
+  |> pog.parameter(pog.int(id))
+  |> pog.parameter(pog.text(lock_token))
+  |> pog.parameter(pog.text(error))
+  |> pog.returning(int_field_decoder())
+  |> pog.execute(on: connection)
+  |> result.map(fn(returned) {
+    case returned.rows {
+      [_, ..] -> Finalized
+      [] -> StaleLease
+    }
+  })
   |> result.map_error(StoreError)
 }
 
@@ -1424,6 +1518,7 @@ fn outbox_message_decoder() -> decode.Decoder(OutboxMessage) {
   use type_ <- decode.field(7, decode.string)
   use metadata <- decode.field(8, decode.string)
   use payload <- decode.field(9, decode.bit_array)
+  use lock_token <- decode.field(10, decode.string)
   decode.success(OutboxMessage(
     id: id,
     source_position: factos.SequencePosition(source_position),
@@ -1435,6 +1530,7 @@ fn outbox_message_decoder() -> decode.Decoder(OutboxMessage) {
     type_: type_,
     metadata: metadata_from_text(metadata),
     payload: payload,
+    lock_token: lock_token,
   ))
 }
 
